@@ -709,8 +709,12 @@ def get_discovery() -> EnvironmentDiscovery:
 
 
 def reset_discovery() -> None:
-    """Reset the global discovery instance (useful for testing)."""
+    """Drop the global discovery singleton (useful for testing).
+
+    Does **not** delete the on-disk cache. The cache is now a persistent
+    per-user file under `$XDG_CACHE_HOME`; wiping it belongs on an explicit
+    [`EnvironmentDiscovery.clear_cache`][] call so test fixtures that only
+    need a fresh singleton cannot clobber a developer's real cache.
+    """
     global _global_discovery
-    if _global_discovery is not None:
-        _global_discovery.clear_cache()
     _global_discovery = None

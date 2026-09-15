@@ -42,8 +42,8 @@ def _isolate_discovery_cache(tmp_path, monkeypatch):
     The cache used to live in the shared temp directory, so tests that
     exercised `_save_cache`/`clear_cache` against a default-constructed
     `EnvironmentDiscovery` only ever disturbed a throwaway file. Now that it
-    lives under `$XDG_CACHE_HOME`, the same tests would write to, and
-    `reset_discovery()` would delete, the cache belonging to whoever runs the
+    lives under `$XDG_CACHE_HOME`, the same tests would write to (and
+    `clear_cache()` would delete) the cache belonging to whoever runs the
     suite. Redirecting the default path keeps that entirely inside `tmp_path`.
     """
     monkeypatch.setattr(
@@ -562,6 +562,26 @@ class TestGlobalDiscovery:
 
         # Should be different instances after reset
         assert discovery1 is not discovery2
+
+    def test_reset_discovery_does_not_unlink_disk_cache(self, tmp_path, monkeypatch):
+        """Singleton reset must not delete the persistent per-user cache.
+
+        Regression for Bugbot on #1167: `reset_discovery()` used to call
+        `clear_cache()`, and suites that only needed a fresh singleton
+        (e.g. `test_auto_env.py`) would delete `~/.cache/openenv/...`.
+        """
+        cache = tmp_path / "discovery_cache.json"
+        cache.write_text("{}")
+        monkeypatch.setattr(_discovery_module, "_default_cache_file", lambda: cache)
+        reset_discovery()
+
+        discovery = get_discovery()
+        assert discovery._cache_file == cache
+
+        reset_discovery()
+
+        assert cache.exists(), "reset_discovery() must not delete the on-disk cache"
+        assert cache.read_text() == "{}"
 
 
 class TestListEnvironments:
