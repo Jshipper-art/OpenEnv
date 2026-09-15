@@ -12,6 +12,7 @@ import sys
 import typer
 from openenv.cli.commands import (
     build,
+    catalog,
     collect,
     fork,
     import_env,
@@ -37,9 +38,9 @@ app.command(name="import", help="Import a third-party environment into OpenEnv")
 app.command(name="build", help="Build Docker images for OpenEnv environments")(
     build.build
 )
-app.command(
-    name="validate", help="Validate environment structure and deployment readiness"
-)(validate.validate)
+app.command(name="validate", help="Validate a package against the OpenEnv quality bar")(
+    validate.validate
+)
 app.command(
     name="push",
     help="Push an OpenEnv environment to Hugging Face Spaces or custom registry",
@@ -60,6 +61,8 @@ app.command(
     name="collect",
     help="Collect rollouts from a deployed OpenEnv environment",
 )(collect.collect)
+app.add_typer(catalog.app, name="catalog")
+app.command(name="discover")(catalog.discover)
 
 
 # Entry point for setuptools
