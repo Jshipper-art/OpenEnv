@@ -165,6 +165,9 @@ JSON Schema validation is necessary but is not the whole profile contract.
 The packaged schemas enforce object shape, required fields, relative-path
 safety, supported literals, conditional artifact/license-evidence presence, and
 exactly one orchestration interface. Other rules require semantic validation:
+The relative-path profile permits printable UTF-8 (including spaces), but
+rejects C0/C1 control characters so untrusted metadata cannot forge CLI or log
+lines.
 
 | Subject | Additional rule |
 |---------|-----------------|

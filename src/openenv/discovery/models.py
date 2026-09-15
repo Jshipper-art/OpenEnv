@@ -53,7 +53,10 @@ def relative_path(value: str) -> str:
         return value
     if (
         not value
-        or "\x00" in value
+        or any(
+            ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F
+            for character in value
+        )
         or "\\" in value
         or PurePosixPath(value).is_absolute()
         or any(part in ("", ".", "..") for part in value.split("/"))
@@ -65,7 +68,8 @@ def relative_path(value: str) -> str:
 # Positive components exclude "." and ".." without lookaround, which some
 # JSON Schema regex engines do not support.
 _PATH_COMPONENT_PATTERN = (
-    r"(?:[^./\\\x00]|\.[^./\\\x00]|\.\.[^./\\\x00]|\.\.\.)[^/\\\x00]*"
+    r"(?:[^./\\\x00-\x1f\x7f-\x9f]|\.[^./\\\x00-\x1f\x7f-\x9f]"
+    r"|\.\.[^./\\\x00-\x1f\x7f-\x9f]|\.\.\.)[^/\\\x00-\x1f\x7f-\x9f]*"
 )
 RelativePath = Annotated[
     NonEmpty,
