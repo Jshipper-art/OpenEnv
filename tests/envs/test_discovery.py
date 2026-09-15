@@ -18,6 +18,8 @@ import stat
 import tempfile
 from unittest.mock import Mock, patch
 
+import openenv.auto._discovery as _discovery_module
+import pytest
 from openenv.auto._discovery import (
     _create_env_info_from_package,
     _default_cache_file,
@@ -30,6 +32,24 @@ from openenv.auto._discovery import (
     get_discovery,
     reset_discovery,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_discovery_cache(tmp_path, monkeypatch):
+    """Keep every test off the real per-user discovery cache.
+
+    The cache used to live in the shared temp directory, so tests that
+    exercised `_save_cache`/`clear_cache` against a default-constructed
+    `EnvironmentDiscovery` only ever disturbed a throwaway file. Now that it
+    lives under `$XDG_CACHE_HOME`, the same tests would write to, and
+    `reset_discovery()` would delete, the cache belonging to whoever runs the
+    suite. Redirecting the default path keeps that entirely inside `tmp_path`.
+    """
+    monkeypatch.setattr(
+        _discovery_module,
+        "_default_cache_file",
+        lambda: tmp_path / "openenv" / "discovery_cache.json",
+    )
 
 
 class TestEnvironmentInfo:
