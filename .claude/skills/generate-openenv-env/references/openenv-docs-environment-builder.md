@@ -435,6 +435,8 @@ async def main():
 asyncio.run(main())
 ```
 
+See [Async vs Sync Usage](../guides/async-sync) for when to prefer each style.
+
 ## Troubleshooting
 
 ### WebSocket Connection Closed During RL Training

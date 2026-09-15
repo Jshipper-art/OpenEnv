@@ -623,6 +623,8 @@ class TestSyncBootstrapConstructors:
         assert isinstance(result, StepResult)
         assert result.observation == {"ready": True}
         assert result.done is False
+        # `with` on the eagerly connected sync handle must reuse its socket.
+        assert len(sockets) == 1
         mock_provider.start_container.assert_called_once_with("my-env:latest")
         mock_provider.stop_container.assert_called_once_with()
 
