@@ -27,6 +27,7 @@ from openenv.auto._discovery import (
     _is_hub_url,
     _is_trusted_cache_file,
     _normalize_env_name,
+    _open_trusted_cache,
     EnvironmentDiscovery,
     EnvironmentInfo,
     get_discovery,
@@ -403,6 +404,10 @@ class TestCacheSecurity:
             assert stat.S_IMODE(discovery._cache_file.stat().st_mode) == 0o600
         assert discovery._load_cache() is not None
 
+    @pytest.fixture(autouse=True)
+    def _tmp(self, tmp_path):
+        self.tmp = tmp_path
+
     def test_symlinked_cache_is_refused(self, tmp_path):
         """The trust check must apply to the object actually read.
 
@@ -485,6 +490,54 @@ class TestCacheSecurity:
 
         assert discovery._cache_file.exists()
         assert stat.S_IMODE(discovery._cache_file.stat().st_mode) == 0o600
+
+    def test_a_fifo_cache_does_not_block_discovery(self):
+        """A planted FIFO must be refused, not waited on.
+
+        Opening a FIFO read-only blocks until a writer appears, and that
+        happens before the descriptor can be inspected, so a trust check that
+        runs after the open never gets to reject it. The open must not block,
+        and only a regular file is acceptable.
+        """
+        if os.name != "posix":
+            return
+
+        import threading
+
+        fifo = self.tmp / "fifo.json"
+        os.mkfifo(fifo, 0o600)
+
+        outcome = {}
+
+        def attempt():
+            outcome["fd"] = _open_trusted_cache(fifo)
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(timeout=5.0)
+
+        assert not worker.is_alive(), "opening a FIFO cache blocked"
+        assert outcome["fd"] is None
+
+    def test_saving_over_a_world_writable_file_does_not_keep_its_mode(self):
+        """`O_CREAT` only applies the mode when it creates the file.
+
+        Writing through an existing inode therefore leaves whatever mode that
+        file already had, so a cache that is already group/world-writable stays
+        that way and the data just written is readable by everyone.
+        """
+        if os.name != "posix":
+            return
+
+        existing = self.tmp / "cache.json"
+        existing.write_text("{}")
+        os.chmod(existing, 0o666)
+
+        discovery = EnvironmentDiscovery()
+        discovery._cache_file = existing
+        discovery._save_cache({})
+
+        assert stat.S_IMODE(existing.stat().st_mode) == 0o600
 
 
 class TestGlobalDiscovery:

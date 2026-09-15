@@ -413,17 +413,22 @@ def _open_trusted_cache(path: Path) -> int | None:
 
     Returns:
         `int` or `None`: an open read-only descriptor the caller must close, or
-        `None` if the file is missing, is a symlink, or is not owned by the
-        current user.
+        `None` if the file is missing, is a symlink, is not a regular file, or
+        is not owned by the current user.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK matters before the descriptor can be inspected: opening a FIFO
+    # read-only otherwise waits for a writer that an attacker simply never
+    # provides, so discovery hangs before any check runs. It has no effect on a
+    # regular file, which is the only thing accepted here anyway.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, flags)
     except OSError:
         # Missing, unreadable, or a symlink (ELOOP under O_NOFOLLOW).
         return None
     try:
-        if not _is_trusted_stat(os.fstat(fd)):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not _is_trusted_stat(info):
             os.close(fd)
             return None
     except OSError:
@@ -545,15 +550,29 @@ class EnvironmentDiscovery:
                 cache_data[env_key] = asdict(env_info)
 
             self._cache_file.parent.mkdir(parents=True, exist_ok=True)
-            # Create the file owner-only rather than writing it and narrowing the
-            # mode afterwards: `open()` applies the umask, so a `chmod` after the
-            # fact leaves a window in which the cache is world-readable. Refuse to
-            # follow a symlink here too, so a planted link cannot redirect the
-            # write.
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(self._cache_file, flags, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump(cache_data, f, indent=2)
+            # Write a new file and move it into place rather than writing
+            # through whatever already sits at the destination. A mode passed to
+            # `os.open` only applies when it creates the file, so truncating an
+            # existing group/world-writable cache would keep that mode and
+            # publish what was just written; and `os.replace` is atomic, so a
+            # reader never observes a half-written cache when serialization
+            # fails part way. `O_EXCL` requires the temporary name to be new,
+            # and 0600 is applied at creation so the umask cannot widen it.
+            tmp_path = self._cache_file.with_name(
+                f"{self._cache_file.name}.{os.getpid()}.tmp"
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(tmp_path, flags, 0o600)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(cache_data, f, indent=2)
+                os.replace(tmp_path, self._cache_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
         except Exception as e:
             logger.warning(f"Failed to save discovery cache: {e}")
