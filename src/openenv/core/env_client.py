@@ -962,14 +962,16 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
                 await child.close()
         self._child_clients.clear()
 
-        # Wait out any backgrounded closes from a dropped socket (see
-        # `_receive()` / `_best_effort_close`) so a real close() call still
-        # sees the handshake through instead of the sync wrapper's
-        # `_stop_loop()` cancelling it mid-flight once the loop stops.
-        if self._pending_close_tasks:
-            await asyncio.gather(*self._pending_close_tasks, return_exceptions=True)
-
         try:
+            # Wait out any backgrounded closes from a dropped socket (see
+            # `_receive()` / `_best_effort_close`) so a real close() call still
+            # sees the handshake through. SyncEnvClient.close() waits for
+            # `_close_async()` before stopping its loop, so the relevant risk
+            # is async-context cancellation of close itself — not `_stop_loop()`.
+            # Keep this gather inside the provider-teardown try/finally so a
+            # cancelled close cannot skip container/process cleanup.
+            if self._pending_close_tasks:
+                await asyncio.gather(*self._pending_close_tasks, return_exceptions=True)
             await self._disconnect_async()
         finally:
             try:

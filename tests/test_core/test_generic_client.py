@@ -17,6 +17,7 @@ Tests cover:
 
 import asyncio
 import os
+from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -1597,6 +1598,58 @@ class TestForeignLoopReconnect:
         assert close_completed, (
             "close() returned before the backgrounded socket close finished"
         )
+
+    @pytest.mark.asyncio
+    async def test_close_async_cancelled_during_pending_gather_still_stops_provider(
+        self,
+    ):
+        """Cancelling `_close_async` while draining pending closes must still
+        tear down the provider and clear provider-owned URLs.
+
+        Regression: the pending-close `gather` used to run before the
+        try/finally that stops the provider. Cancellation of `_close_async`
+        itself propagates from `gather` even with `return_exceptions=True`,
+        which skipped provider teardown and leaked the container/process.
+        """
+
+        class FakeRuntimeProvider:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        provider = FakeRuntimeProvider()
+        client = GenericEnvClient(provider=provider)
+        client._base_url = "http://localhost:8000"
+        client._ws_url = "ws://localhost:8000/ws"
+
+        hang_gate = asyncio.Event()
+
+        async def hang_forever():
+            await hang_gate.wait()
+
+        pending = asyncio.create_task(hang_forever())
+        client._pending_close_tasks.add(pending)
+
+        close_task = asyncio.create_task(client._close_async())
+        await asyncio.sleep(0)  # let close enter the pending-close gather
+        assert not close_task.done()
+
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        hang_gate.set()
+        with suppress(asyncio.CancelledError):
+            await pending
+
+        assert provider.stopped, (
+            "provider.stop() must run even when _close_async is cancelled "
+            "during the pending-close gather"
+        )
+        assert client._base_url is None
+        assert client._ws_url is None
 
 
 # ============================================================================
