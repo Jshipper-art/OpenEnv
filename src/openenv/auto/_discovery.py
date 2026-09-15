@@ -345,9 +345,11 @@ def _default_cache_file() -> Path:
     shared, world-writable temporary directory. A fixed path under the shared temp dir
     lets another local user pre-create the cache file and redirect discovery to
     attacker-controlled import paths (`import_module` on a cached `client_module_path`).
+    Per the XDG Base Directory specification, relative `XDG_CACHE_HOME` values are
+    ignored so an untrusted working tree cannot supply a victim-owned cache file.
     """
     base = os.environ.get("XDG_CACHE_HOME")
-    root = Path(base) if base else Path.home() / ".cache"
+    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
     return root / "openenv" / "discovery_cache.json"
 
 
