@@ -538,6 +538,13 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             self._ws = None
             self._ws_loop = None
 
+        # A timed-out request drops its socket immediately but closes it in the
+        # background so the timeout itself remains prompt. Wait for that close
+        # before opening a replacement: the old server-side session continues
+        # occupying a capacity slot until the close handshake finishes, and
+        # many environments allow only one session.
+        await self._drain_pending_close_tasks()
+
         try:
             self._start_provider_if_needed()
         except Exception:
@@ -578,6 +585,10 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         if self._ws is not None:
             ws = self._ws
             ws_loop = self._ws_loop
+            # Detach first so cancellation during the close handshake cannot
+            # leave a stale socket cached for a later operation.
+            self._ws = None
+            self._ws_loop = None
             same_loop = ws_loop is asyncio.get_running_loop()
             try:
                 if same_loop:
@@ -589,8 +600,23 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
                     await ws.close()
             except Exception:
                 pass
-            self._ws = None
-            self._ws_loop = None
+
+    async def _drain_pending_close_tasks(self) -> None:
+        """Wait for background socket closes owned by the current event loop.
+
+        Shielding keeps cancellation of the caller from cancelling the close
+        tasks themselves. This matters both before reconnecting, when the old
+        server session must release its capacity slot, and during explicit
+        client shutdown.
+        """
+        loop = asyncio.get_running_loop()
+        tasks = [
+            task
+            for task in tuple(self._pending_close_tasks)
+            if not task.done() and task.get_loop() is loop
+        ]
+        if tasks:
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
 
     async def _ensure_connected(self) -> None:
         """Ensure WebSocket connection is established on the current loop.
@@ -963,16 +989,16 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         self._child_clients.clear()
 
         try:
-            # Wait out any backgrounded closes from a dropped socket (see
-            # `_receive()` / `_best_effort_close`) so a real close() call still
-            # sees the handshake through. SyncEnvClient.close() waits for
-            # `_close_async()` before stopping its loop, so the relevant risk
-            # is async-context cancellation of close itself — not `_stop_loop()`.
-            # Keep this gather inside the provider-teardown try/finally so a
-            # cancelled close cannot skip container/process cleanup.
-            if self._pending_close_tasks:
-                await asyncio.gather(*self._pending_close_tasks, return_exceptions=True)
-            await self._disconnect_async()
+            try:
+                # A real close waits out backgrounded closes, but shield them
+                # from cancellation so their socket handshakes aren't
+                # abandoned midway.
+                await self._drain_pending_close_tasks()
+            finally:
+                # Run even when pending-close draining is cancelled. A client
+                # may already have reconnected, and that current socket must
+                # not remain cached or open during teardown.
+                await self._disconnect_async()
         finally:
             try:
                 if self._provider is not None:
