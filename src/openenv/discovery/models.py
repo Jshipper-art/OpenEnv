@@ -67,6 +67,7 @@ def relative_path(value: str) -> str:
 
 # Positive components exclude "." and ".." without lookaround, which some
 # JSON Schema regex engines do not support.
+_CONTROL_CHARACTER_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
 _PATH_COMPONENT_PATTERN = (
     r"(?:[^./\\\x00-\x1f\x7f-\x9f]|\.[^./\\\x00-\x1f\x7f-\x9f]"
     r"|\.\.[^./\\\x00-\x1f\x7f-\x9f]|\.\.\.)[^/\\\x00-\x1f\x7f-\x9f]*"
@@ -83,6 +84,7 @@ RelativePath = Annotated[
                         rf"(?:/{_PATH_COMPONENT_PATTERN})*)$"
                     ),
                 },
+                {"not": {"pattern": _CONTROL_CHARACTER_PATTERN}},
             ]
         }
     ),

@@ -16,8 +16,7 @@ from pydantic import ValidationError
 
 REVISION = "a" * 40
 ASCII_CONTROL_PATHS = [
-    f"envs/control-{chr(codepoint)}"
-    for codepoint in [*range(0x20), *range(0x7F, 0xA0)]
+    f"envs/control-{chr(codepoint)}" for codepoint in [*range(0x20), *range(0x7F, 0xA0)]
 ]
 
 
