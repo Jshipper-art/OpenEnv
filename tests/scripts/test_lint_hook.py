@@ -83,6 +83,10 @@ def repo(tmp_path: pathlib.Path) -> pathlib.Path:
     run("git", "init", "-q")
     run("git", "config", "user.email", "t@example.com")
     run("git", "config", "user.name", "t")
+    # Keep the throwaway repo hermetic against developer global config
+    # (commit signing / hooksPath), same pattern as tests/discovery/.
+    run("git", "config", "commit.gpgsign", "false")
+    run("git", "config", "core.hooksPath", "/dev/null")
     run("git", "add", "-A")
     run("git", "commit", "-qm", "init")
 
