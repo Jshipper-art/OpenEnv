@@ -1638,8 +1638,11 @@ class TestForeignLoopReconnect:
         replacement_ws.state = State.OPEN
         replacement_ws.recv.return_value = '{"type": "state", "data": {}}'
 
+        async def fake_ws_connect(*args, **kwargs):
+            return replacement_ws
+
         with patch(
-            "openenv.core.env_client.ws_connect", return_value=replacement_ws
+            "openenv.core.env_client.ws_connect", side_effect=fake_ws_connect
         ) as mock_connect:
             reconnect = asyncio.create_task(client._connect_async())
             await asyncio.sleep(0)
