@@ -1840,8 +1840,8 @@ class TestForeignLoopReconnect:
         await client._close_async()
 
     @pytest.mark.asyncio
-    async def test_cancelled_child_close_still_tears_down_parent(self):
-        """Child cancellation must not skip the parent's socket and provider."""
+    async def test_cancelled_child_close_finishes_all_children_and_parent(self):
+        """Cancellation during one child must not strand later sessions."""
 
         class FakeRuntimeProvider:
             def __init__(self):
@@ -1850,12 +1850,24 @@ class TestForeignLoopReconnect:
             def stop(self):
                 self.stopped = True
 
-        child_close_started = asyncio.Event()
+        first_close_started = asyncio.Event()
+        release_first_close = asyncio.Event()
 
-        class SlowChild:
+        class SlowFirstChild:
+            def __init__(self):
+                self.closed = False
+
             async def close(self):
-                child_close_started.set()
-                await asyncio.Event().wait()
+                first_close_started.set()
+                await release_first_close.wait()
+                self.closed = True
+
+        class LaterChild:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
 
         class CurrentSocket:
             state = State.OPEN
@@ -1870,18 +1882,33 @@ class TestForeignLoopReconnect:
         client = GenericEnvClient(provider=provider)
         client._base_url = "http://localhost:8000"
         client._ws_url = "ws://localhost:8000/ws"
-        client._child_clients.append(SlowChild())
+        first_child = SlowFirstChild()
+        later_child = LaterChild()
+        client._child_clients.extend([first_child, later_child])
 
         current_ws = CurrentSocket()
         client._ws = current_ws
         client._ws_loop = asyncio.get_running_loop()
 
         close_task = asyncio.create_task(client._close_async())
-        await child_close_started.wait()
+        await asyncio.wait_for(first_close_started.wait(), timeout=1)
         close_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await close_task
+        await asyncio.sleep(0)
 
+        assert not close_task.done()
+        assert later_child.closed
+        assert not provider.stopped
+
+        release_first_close.set()
+        cancelled = False
+        try:
+            await close_task
+        except asyncio.CancelledError:
+            cancelled = True
+
+        assert cancelled
+        assert first_child.closed
+        assert later_child.closed
         assert client._child_clients == []
         assert client._ws is None
         assert current_ws.state == State.CLOSED

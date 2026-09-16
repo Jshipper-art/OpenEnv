@@ -993,18 +993,34 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         """
         try:
             try:
-                # Parent teardown must not depend on every child finishing.
-                # Cancellation while awaiting a child still falls through to
-                # detach/close this client's socket and stop its provider.
-                for child in list(self._child_clients):
-                    with suppress(Exception):
-                        await child.close()
+                children = list(self._child_clients)
+                self._child_clients.clear()
+                if children:
+
+                    async def close_child(child: EnvClient) -> None:
+                        with suppress(Exception):
+                            await child.close()
+
+                    # Start every child close before awaiting any one of them.
+                    # Defer caller cancellation until all closes finish so a
+                    # suspended first child cannot strand later sessions.
+                    child_closes = asyncio.gather(
+                        *(close_child(child) for child in children),
+                        return_exceptions=True,
+                    )
+                    cancellation: asyncio.CancelledError | None = None
+                    while not child_closes.done():
+                        try:
+                            await asyncio.shield(child_closes)
+                        except asyncio.CancelledError as exc:
+                            cancellation = exc
+                    if cancellation is not None:
+                        raise cancellation
                 # A real close waits out backgrounded closes, but shield them
                 # from cancellation so their socket handshakes aren't
                 # abandoned midway.
                 await self._drain_pending_close_tasks()
             finally:
-                self._child_clients.clear()
                 # Run even when pending-close draining is cancelled. A client
                 # may already have reconnected, and that current socket must
                 # not remain cached or open during teardown.
