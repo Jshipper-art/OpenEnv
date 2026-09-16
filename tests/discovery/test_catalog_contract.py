@@ -18,6 +18,9 @@ REVISION = "a" * 40
 ASCII_CONTROL_PATHS = [
     f"envs/control-{chr(codepoint)}" for codepoint in [*range(0x20), *range(0x7F, 0xA0)]
 ]
+UNICODE_LINE_SEPARATOR_PATHS = [
+    f"envs/separator-{chr(codepoint)}" for codepoint in (0x2028, 0x2029)
+]
 
 
 @pytest.fixture
@@ -96,6 +99,7 @@ def test_tool_declaration_cannot_borrow_another_revision(card):
         "envs/echo/",
         "envs/./echo",
         *ASCII_CONTROL_PATHS,
+        *UNICODE_LINE_SEPARATOR_PATHS,
         "envs/trailing\n",
         ".\n",
         "..\n",
