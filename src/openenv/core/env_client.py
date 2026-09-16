@@ -996,34 +996,36 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         If this client was created via from_docker_image() or from_env(),
         this will also stop and remove the associated container/process.
         """
-        for child in list(self._child_clients):
-            with suppress(Exception):
-                await child.close()
-        self._child_clients.clear()
-
         try:
-            try:
-                # A real close waits out backgrounded closes, but shield them
-                # from cancellation so their socket handshakes aren't
-                # abandoned midway.
-                await self._drain_pending_close_tasks()
-            finally:
-                # Run even when pending-close draining is cancelled. A client
-                # may already have reconnected, and that current socket must
-                # not remain cached or open during teardown.
-                await self._disconnect_async()
+            for child in list(self._child_clients):
+                with suppress(Exception):
+                    await child.close()
         finally:
+            # Parent teardown must run even when a child close is cancelled.
+            self._child_clients.clear()
             try:
-                if self._provider is not None:
-                    # Handle both ContainerProvider and RuntimeProvider
-                    if hasattr(self._provider, "stop_container"):
-                        self._provider.stop_container()
-                    elif hasattr(self._provider, "stop"):
-                        self._provider.stop()
+                try:
+                    # A real close waits out backgrounded closes, but shield them
+                    # from cancellation so their socket handshakes aren't
+                    # abandoned midway.
+                    await self._drain_pending_close_tasks()
+                finally:
+                    # Run even when pending-close draining is cancelled. A client
+                    # may already have reconnected, and that current socket must
+                    # not remain cached or open during teardown.
+                    await self._disconnect_async()
             finally:
-                if self._start_provider_on_connect:
-                    self._base_url = None
-                    self._ws_url = None
+                try:
+                    if self._provider is not None:
+                        # Handle both ContainerProvider and RuntimeProvider
+                        if hasattr(self._provider, "stop_container"):
+                            self._provider.stop_container()
+                        elif hasattr(self._provider, "stop"):
+                            self._provider.stop()
+                finally:
+                    if self._start_provider_on_connect:
+                        self._base_url = None
+                        self._ws_url = None
 
     def _stop_provider_best_effort(self) -> None:
         """Stop the underlying provider directly, ignoring any errors.

@@ -363,6 +363,27 @@ class TestCacheSecurity:
         assert path.is_absolute()
         assert path.resolve() != planted.resolve()
 
+    def test_relative_home_cannot_redirect_into_working_tree(
+        self, tmp_path, monkeypatch
+    ):
+        """A relative HOME must not select a cache planted in the checkout."""
+        checkout = tmp_path / "untrusted-checkout"
+        planted = checkout / "cache" / ".cache" / "openenv" / "discovery_cache.json"
+        planted.parent.mkdir(parents=True)
+        planted.write_text("{}")
+
+        monkeypatch.chdir(checkout)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setenv("HOME", "cache")
+
+        path = _default_cache_file()
+
+        assert path.is_absolute()
+        assert path.resolve() != planted.resolve()
+        assert "openenv" in path.parts
+        uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
+        assert f"openenv-{uid}-cache" in path.parts
+
     def test_world_writable_cache_is_not_trusted(self, tmp_path):
         f = tmp_path / "cache.json"
         f.write_text("{}")

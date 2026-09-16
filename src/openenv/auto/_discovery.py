@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import stat
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Type
@@ -347,9 +348,26 @@ def _default_cache_file() -> Path:
     attacker-controlled import paths (`import_module` on a cached `client_module_path`).
     Per the XDG Base Directory specification, relative `XDG_CACHE_HOME` values are
     ignored so an untrusted working tree cannot supply a victim-owned cache file.
+    Relative `HOME` values are likewise rejected: `Path.home()` must not be
+    resolved against the current working directory.
     """
     base = os.environ.get("XDG_CACHE_HOME")
-    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
+    if base and Path(base).is_absolute():
+        root = Path(base)
+    else:
+        home = Path.home()
+        if home.is_absolute():
+            root = home / ".cache"
+        else:
+            # Keep the fallback absolute and uid-scoped so a shared temp root
+            # cannot be turned into a fixed, cross-user planting target.
+            uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
+            root = Path(tempfile.gettempdir()) / f"openenv-{uid}-cache"
+            if not root.is_absolute():
+                raise RuntimeError(
+                    "Cannot resolve an absolute discovery cache directory when "
+                    "XDG_CACHE_HOME and HOME are both missing or relative"
+                )
     return root / "openenv" / "discovery_cache.json"
 
 

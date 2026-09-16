@@ -1836,6 +1836,58 @@ class TestForeignLoopReconnect:
         await pending
         assert dropped_ws.state == State.CLOSED
 
+    @pytest.mark.asyncio
+    async def test_cancelled_child_close_still_tears_down_parent(self):
+        """Cancellation during child.close() must not skip parent teardown."""
+
+        class FakeRuntimeProvider:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        child_started = asyncio.Event()
+        release_child = asyncio.Event()
+
+        class SlowChild:
+            async def close(self):
+                child_started.set()
+                await release_child.wait()
+
+        class ParentSocket:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def close(self):
+                self.state = State.CLOSED
+
+        provider = FakeRuntimeProvider()
+        client = GenericEnvClient(provider=provider)
+        client._base_url = "http://localhost:8000"
+        client._ws_url = "ws://localhost:8000/ws"
+        client._child_clients.append(SlowChild())
+        parent_ws = ParentSocket()
+        client._ws = parent_ws
+        client._ws_loop = asyncio.get_running_loop()
+
+        close_task = asyncio.create_task(client._close_async())
+        await child_started.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        assert provider.stopped
+        assert client._base_url is None
+        assert client._ws_url is None
+        assert client._ws is None
+        assert parent_ws.state == State.CLOSED
+        assert client._child_clients == []
+
+        release_child.set()
+
 
 # ============================================================================
 # Integration Tests (require running server)
