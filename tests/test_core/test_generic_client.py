@@ -174,6 +174,55 @@ class TestGenericEnvClientInstantiation:
         assert client._child_clients == []
         mock_provider.stop_container.assert_called_once_with()
 
+    @pytest.mark.asyncio
+    async def test_cancelled_child_close_still_tears_down_parent(self):
+        """Child-close cancellation must not bypass parent socket/provider cleanup."""
+
+        class FakeRuntimeProvider:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        child_close_started = asyncio.Event()
+
+        class SlowChild:
+            async def close(self):
+                child_close_started.set()
+                await asyncio.sleep(10)
+
+        class ParentSocket:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def close(self):
+                self.state = State.CLOSED
+
+        provider = FakeRuntimeProvider()
+        client = GenericEnvClient(provider=provider)
+        client._base_url = "http://localhost:8000"
+        client._ws_url = "ws://localhost:8000/ws"
+        parent_ws = ParentSocket()
+        client._ws = parent_ws
+        client._ws_loop = asyncio.get_running_loop()
+        client._child_clients.append(SlowChild())
+
+        close_call = asyncio.create_task(client._close_async())
+        await child_close_started.wait()
+        close_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_call
+
+        assert client._child_clients == []
+        assert client._ws is None
+        assert parent_ws.state == State.CLOSED
+        assert provider.stopped
+        assert client._base_url is None
+        assert client._ws_url is None
+
     def test_session_client_filters_constructor_kwargs(self):
         """Child creation respects subclasses with narrower __init__ signatures."""
 
