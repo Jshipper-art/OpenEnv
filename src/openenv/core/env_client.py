@@ -991,6 +991,40 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     def close(self) -> Any:
         return self._dispatch(self._close_async)
 
+    async def _close_child_clients(self) -> asyncio.CancelledError | None:
+        """Close every captured child while deferring caller cancellation."""
+        children = list(self._child_clients)
+        self._child_clients.clear()
+        close_tasks = []
+        deferred_cancellation: asyncio.CancelledError | None = None
+
+        for child in children:
+            try:
+                close_tasks.append(asyncio.ensure_future(child.close()))
+            except asyncio.CancelledError as exc:
+                if deferred_cancellation is None:
+                    deferred_cancellation = exc
+            except Exception:
+                pass  # Best effort
+
+        if close_tasks:
+            close_group = asyncio.gather(*close_tasks, return_exceptions=True)
+            while not close_group.done():
+                try:
+                    await asyncio.shield(close_group)
+                except asyncio.CancelledError as exc:
+                    if deferred_cancellation is None:
+                        deferred_cancellation = exc
+
+            for result in close_group.result():
+                if (
+                    isinstance(result, asyncio.CancelledError)
+                    and deferred_cancellation is None
+                ):
+                    deferred_cancellation = result
+
+        return deferred_cancellation
+
     async def _close_async(self) -> None:
         """
         Close the WebSocket connection and clean up resources.
@@ -998,23 +1032,32 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         If this client was created via from_docker_image() or from_env(),
         this will also stop and remove the associated container/process.
         """
+        deferred_cancellation: asyncio.CancelledError | None = None
         try:
             try:
                 try:
-                    for child in list(self._child_clients):
-                        with suppress(Exception):
-                            await child.close()
-                finally:
-                    self._child_clients.clear()
+                    child_cancellation = await self._close_child_clients()
+                except asyncio.CancelledError as exc:
+                    child_cancellation = exc
+                if child_cancellation is not None:
+                    deferred_cancellation = child_cancellation
 
                 # A real close waits out backgrounded closes, while shielding
                 # their socket handshakes from cancellation.
-                await self._drain_pending_close_tasks()
+                try:
+                    await self._drain_pending_close_tasks()
+                except asyncio.CancelledError as exc:
+                    if deferred_cancellation is None:
+                        deferred_cancellation = exc
             finally:
                 # Run even when child or pending-close cleanup is cancelled. A
                 # client may already have reconnected, and that current socket
                 # must not remain cached or open during teardown.
-                await self._disconnect_async()
+                try:
+                    await self._disconnect_async()
+                except asyncio.CancelledError as exc:
+                    if deferred_cancellation is None:
+                        deferred_cancellation = exc
         finally:
             try:
                 if self._provider is not None:
@@ -1027,6 +1070,9 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
                 if self._start_provider_on_connect:
                     self._base_url = None
                     self._ws_url = None
+
+        if deferred_cancellation is not None:
+            raise deferred_cancellation
 
     def _stop_provider_best_effort(self) -> None:
         """Stop the underlying provider directly, ignoring any errors.

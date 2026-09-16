@@ -175,8 +175,8 @@ class TestGenericEnvClientInstantiation:
         mock_provider.stop_container.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_cancelled_child_close_still_tears_down_parent(self):
-        """Child-close cancellation must not bypass parent socket/provider cleanup."""
+    async def test_cancelled_child_close_still_closes_all_children_and_parent(self):
+        """Cancellation waits for every child before parent teardown."""
 
         class FakeRuntimeProvider:
             def __init__(self):
@@ -185,12 +185,26 @@ class TestGenericEnvClientInstantiation:
             def stop(self):
                 self.stopped = True
 
-        child_close_started = asyncio.Event()
+        first_close_started = asyncio.Event()
+        release_first_close = asyncio.Event()
+        second_close_completed = asyncio.Event()
 
-        class SlowChild:
+        class FirstChild:
+            def __init__(self):
+                self.closed = False
+
             async def close(self):
-                child_close_started.set()
-                await asyncio.sleep(10)
+                first_close_started.set()
+                await release_first_close.wait()
+                self.closed = True
+
+        class SecondChild:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+                second_close_completed.set()
 
         class ParentSocket:
             state = State.OPEN
@@ -208,14 +222,28 @@ class TestGenericEnvClientInstantiation:
         parent_ws = ParentSocket()
         client._ws = parent_ws
         client._ws_loop = asyncio.get_running_loop()
-        client._child_clients.append(SlowChild())
+        first_child = FirstChild()
+        second_child = SecondChild()
+        client._child_clients.extend([first_child, second_child])
 
         close_call = asyncio.create_task(client._close_async())
-        await child_close_started.wait()
+        await first_close_started.wait()
         close_call.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await close_call
 
+        await asyncio.wait_for(second_close_completed.wait(), timeout=1)
+        assert not close_call.done()
+        assert parent_ws.state != State.CLOSED
+        assert not provider.stopped
+
+        release_first_close.set()
+        close_results = await asyncio.wait_for(
+            asyncio.gather(close_call, return_exceptions=True), timeout=1
+        )
+
+        assert len(close_results) == 1
+        assert isinstance(close_results[0], asyncio.CancelledError)
+        assert first_child.closed
+        assert second_child.closed
         assert client._child_clients == []
         assert client._ws is None
         assert parent_ws.state == State.CLOSED
