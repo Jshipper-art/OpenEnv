@@ -1721,6 +1721,57 @@ class TestForeignLoopReconnect:
         await client._close_async()
 
     @pytest.mark.asyncio
+    async def test_cancelled_disconnect_drains_current_socket_before_reconnect(self):
+        """A cancelled disconnect must keep tracking the detached socket."""
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+
+        class SlowClose:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def close(self):
+                close_started.set()
+                await release_close.wait()
+                self.state = State.CLOSED
+
+        client = GenericEnvClient(base_url="http://localhost:8000")
+        current_ws = SlowClose()
+        client._ws = current_ws
+        client._ws_loop = asyncio.get_running_loop()
+
+        disconnect = asyncio.create_task(client._disconnect_async())
+        await asyncio.wait_for(close_started.wait(), timeout=1)
+        disconnect.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await disconnect
+
+        replacement_ws = AsyncMock()
+        replacement_ws.state = State.OPEN
+
+        async def fake_ws_connect(*args, **kwargs):
+            return replacement_ws
+
+        with patch(
+            "openenv.core.env_client.ws_connect", side_effect=fake_ws_connect
+        ) as mock_connect:
+            reconnect = asyncio.create_task(client._connect_async())
+            await asyncio.sleep(0)
+            reconnect_waited_for_close = not reconnect.done()
+            calls_before_close_finished = mock_connect.call_count
+
+            release_close.set()
+            await asyncio.wait_for(reconnect, timeout=1)
+
+        assert reconnect_waited_for_close
+        assert calls_before_close_finished == 0
+        assert current_ws.state == State.CLOSED
+        assert client._ws is replacement_ws
+        await client._close_async()
+
+    @pytest.mark.asyncio
     async def test_cancelled_close_still_closes_current_and_pending_sockets(self):
         """Cancellation while draining an old socket must not leak either one."""
 

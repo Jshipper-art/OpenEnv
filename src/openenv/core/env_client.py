@@ -255,6 +255,15 @@ async def _best_effort_close(ws: ClientConnection) -> None:
         pass  # Best effort
 
 
+async def _best_effort_disconnect(ws: ClientConnection) -> None:
+    """Notify the server, then close the socket without propagating failures."""
+    try:
+        await ws.send(json.dumps({"type": "close"}))
+    except (Exception, asyncio.CancelledError):
+        pass  # Best effort
+    await _best_effort_close(ws)
+
+
 class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     """
     Async environment client for persistent sessions.
@@ -580,6 +589,16 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     def disconnect(self) -> Any:
         return self._dispatch(self._disconnect_async)
 
+    def _schedule_socket_close(
+        self, ws: ClientConnection, *, notify_server: bool = False
+    ) -> asyncio.Task[None]:
+        """Schedule and track a socket close on the current event loop."""
+        close = _best_effort_disconnect(ws) if notify_server else _best_effort_close(ws)
+        close_task = asyncio.create_task(close)
+        self._pending_close_tasks.add(close_task)
+        close_task.add_done_callback(self._pending_close_tasks.discard)
+        return close_task
+
     async def _disconnect_async(self) -> None:
         """Close the WebSocket connection."""
         if self._ws is not None:
@@ -590,16 +609,12 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             self._ws = None
             self._ws_loop = None
             same_loop = ws_loop is asyncio.get_running_loop()
-            try:
-                if same_loop:
-                    await ws.send(json.dumps({"type": "close"}))
-            except Exception:
-                pass  # Best effort
-            try:
-                if same_loop:
-                    await ws.close()
-            except Exception:
-                pass
+            if same_loop:
+                # Track the detached socket before awaiting anything. If this
+                # caller is cancelled, the shielded task keeps closing and a
+                # later reconnect drains it before opening a replacement.
+                close_task = self._schedule_socket_close(ws, notify_server=True)
+                await asyncio.shield(close_task)
 
     async def _drain_pending_close_tasks(self) -> None:
         """Wait for background socket closes owned by the current event loop.
@@ -667,9 +682,7 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             # would actually block for up to 10s before its deadline was
             # honored. Scheduling it lets the exception propagate
             # immediately while the close still happens in the background.
-            close_task = asyncio.ensure_future(_best_effort_close(ws))
-            self._pending_close_tasks.add(close_task)
-            close_task.add_done_callback(self._pending_close_tasks.discard)
+            self._schedule_socket_close(ws)
             raise
         return json.loads(raw)
 
