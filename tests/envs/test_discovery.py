@@ -367,11 +367,7 @@ class TestCacheSecurity:
         """Invalid XDG and HOME paths must not resolve inside the checkout."""
         checkout = tmp_path / "untrusted-checkout"
         planted = (
-            checkout
-            / "relative-home"
-            / ".cache"
-            / "openenv"
-            / "discovery_cache.json"
+            checkout / "relative-home" / ".cache" / "openenv" / "discovery_cache.json"
         )
         planted.parent.mkdir(parents=True)
         planted.write_text("{}")
