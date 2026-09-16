@@ -416,6 +416,7 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
                         try:
                             await self._http_client.aclose()
                         except Exception:
+                            # Best effort — do not mask provider/websocket teardown
                             pass
                         finally:
                             self._http_client = None
