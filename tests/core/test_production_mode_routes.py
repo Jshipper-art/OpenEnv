@@ -27,7 +27,7 @@ Test coverage:
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -1759,23 +1759,37 @@ class TestMCPClientProductionMode:
     """Tests for MCP client using production mode."""
 
     async def test_mcp_client_can_use_production_endpoints(self):
-        """Test MCPToolClient can use production MCP endpoints directly."""
+        """Explicit direct mode uses MCP endpoints without opening Gym transport."""
         from openenv.core.mcp_client import MCPToolClient
 
         client = MCPToolClient(base_url="http://localhost:8000")
-
-        # Client should have option to use production mode (bypasses step())
-        assert hasattr(client, "use_production_mode")
-
         client.use_production_mode = True
 
-        # Calling list_tools() should use /mcp endpoint, not step()
-        with patch.object(client, "step") as mock_step:
-            tools = await client.list_tools()
-
-            # step() should NOT be called in production mode
+        with (
+            patch.object(
+                client,
+                "_production_mcp_request",
+                new=AsyncMock(
+                    side_effect=[
+                        {"result": {"session_id": "test-session"}},
+                        {"result": {"tools": []}},
+                        {"result": {"closed": True}},
+                    ]
+                ),
+            ) as mcp_request,
+            patch.object(client, "step") as mock_step,
+        ):
+            await client.connect()
+            assert client._ws is None
+            assert await client.list_tools() == []
             mock_step.assert_not_called()
-            assert len(tools) >= 0
+            await client.close()
+
+        assert [call.args[0] for call in mcp_request.await_args_list] == [
+            "openenv/session/create",
+            "tools/list",
+            "openenv/session/close",
+        ]
 
     @pytest.mark.skip(reason="Implementation detail - httpx is now imported locally")
     async def test_client_production_mode_uses_http_mcp_endpoint(self):

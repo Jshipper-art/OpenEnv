@@ -229,6 +229,68 @@ class TestModeBehavior:
                     assert step_message["data"].get("type") == "list_tools"
 
 
+class TestDirectMCPMode:
+    """Explicit HTTP MCP mode must remain tools-only and single-transport."""
+
+    @pytest.mark.asyncio
+    async def test_direct_mode_connect_does_not_open_websocket(self, clean_env):
+        client = MCPToolClient(base_url="http://localhost:8000")
+        client.use_production_mode = True
+
+        with patch(
+            "openenv.core.env_client.ws_connect", new_callable=AsyncMock
+        ) as ws_connect:
+            await client.connect()
+
+        ws_connect.assert_not_awaited()
+        assert client._ws is None
+        assert client._production_session_id is None
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_direct_mode_rejects_gym_lifecycle_methods(self, clean_env):
+        client = MCPToolClient(base_url="http://localhost:8000")
+        client.use_production_mode = True
+
+        with pytest.raises(RuntimeError, match="supports only"):
+            await client.reset()
+        with pytest.raises(RuntimeError, match="supports only"):
+            await client.step(ListToolsAction())
+        with pytest.raises(RuntimeError, match="supports only"):
+            await client.state()
+
+        await client.close()
+
+    def test_direct_mode_cannot_change_with_live_websocket(self, clean_env):
+        client = MCPToolClient(base_url="http://localhost:8000")
+        client._ws = MagicMock()
+
+        with pytest.raises(RuntimeError, match="transport is active"):
+            client.use_production_mode = True
+
+    @pytest.mark.asyncio
+    async def test_direct_mode_list_tools_propagates_jsonrpc_errors(self, clean_env):
+        client = MCPToolClient(base_url="http://localhost:8000")
+        client.use_production_mode = True
+
+        with (
+            patch.object(
+                client,
+                "_ensure_production_session",
+                new=AsyncMock(return_value="test-session"),
+            ),
+            patch.object(
+                client,
+                "_production_mcp_request",
+                new=AsyncMock(return_value={"error": {"message": "transport failed"}}),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="transport failed"):
+                await client.list_tools()
+
+        await client.close()
+
+
 class TestMCPClientCleanup:
     """MCP-specific resources must use the common close dispatch path."""
 
