@@ -349,7 +349,13 @@ def _default_cache_file() -> Path:
     ignored so an untrusted working tree cannot supply a victim-owned cache file.
     """
     base = os.environ.get("XDG_CACHE_HOME")
-    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
+    if base and Path(base).is_absolute():
+        root = Path(base)
+    else:
+        home = Path.home()
+        if not home.is_absolute():
+            raise RuntimeError("Cannot determine an absolute user cache directory")
+        root = home / ".cache"
     return root / "openenv" / "discovery_cache.json"
 
 
