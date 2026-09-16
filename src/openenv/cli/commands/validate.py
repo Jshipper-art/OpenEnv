@@ -2,6 +2,7 @@
 
 """OpenEnv validate command."""
 
+import json
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -51,6 +52,12 @@ def _render_report(report: ValidationReport | dict[str, Any]) -> str:
                 details = criterion.get("details")
                 if details:
                     lines.append(f"          {details}")
+                for label in ("expected", "actual"):
+                    if label in criterion:
+                        value = json.dumps(
+                            criterion[label], ensure_ascii=False, sort_keys=True
+                        )
+                        lines.append(f"          {label}: {value}")
         verdict = "PASS" if report.get("passed", False) else "FAIL"
         lines.append(f"Verdict: {verdict}")
         return "\n".join(lines)

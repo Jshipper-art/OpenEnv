@@ -210,6 +210,38 @@ def test_validate_command_runtime_target_without_json_outputs_human_readable() -
     assert "Verdict: PASS" in result.output
 
 
+def test_validate_command_runtime_failure_outputs_diagnostics() -> None:
+    mock_report = {
+        "target": "https://example.com",
+        "validation_type": "running_environment",
+        "standard_version": "1.0.0",
+        "standard_profile": "openenv-http/1.x",
+        "mode": "simulation",
+        "passed": False,
+        "criteria": [
+            {
+                "id": "health_endpoint",
+                "description": "GET /health returns healthy status",
+                "passed": False,
+                "expected": {"status_code": 200, "status": "healthy"},
+                "actual": {"status_code": 500, "status": None},
+            }
+        ],
+    }
+
+    with patch(
+        "openenv.cli.commands.validate.validate_running_environment",
+        return_value=mock_report,
+    ):
+        result = runner.invoke(app, ["validate", "https://example.com"])
+
+    assert result.exit_code == 1
+    assert "FAIL  health_endpoint" in result.output
+    assert 'expected: {"status": "healthy", "status_code": 200}' in result.output
+    assert 'actual: {"status": null, "status_code": 500}' in result.output
+    assert "Verdict: FAIL" in result.output
+
+
 def test_validate_command_runtime_target_with_output_writes_file(
     tmp_path: Path,
 ) -> None:
@@ -297,7 +329,6 @@ def test_validate_command_runtime_target_output_write_failure(
 
     assert result.exit_code == 3
     assert "Internal error:" in result.output
-
 
 
 def test_validate_command_local_path_without_validation_block_fails(
