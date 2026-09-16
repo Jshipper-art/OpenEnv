@@ -21,8 +21,9 @@ Test coverage:
 - Environment: Code mode with mode-aware tool registration
 """
 
+import asyncio
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp import FastMCP
@@ -226,6 +227,96 @@ class TestModeBehavior:
                     step_message = step_call[0][0][0]
                     assert "data" in step_message
                     assert step_message["data"].get("type") == "list_tools"
+
+
+class TestMCPClientCleanup:
+    """MCP-specific resources must use the common close dispatch path."""
+
+    def test_bare_close_preserves_sync_dispatch(self, clean_env):
+        """Calling close outside an event loop must resolve cleanup synchronously."""
+        client = MCPToolClient(base_url="http://localhost:8000")
+        client._production_session_id = "test-session"
+
+        try:
+            with patch.object(
+                client,
+                "_production_mcp_request",
+                new=AsyncMock(return_value={"result": {}}),
+            ) as request:
+                result = client.close()
+
+            assert result is None
+            request.assert_awaited_once_with(
+                "openenv/session/close", {"session_id": "test-session"}
+            )
+            assert client._production_session_id is None
+        finally:
+            if client._sync_client is not None:
+                client._sync_client._stop_loop()
+
+    def test_sync_wrapper_close_releases_http_resources(self, clean_env):
+        """Sync wrapper close must release the MCP session and HTTP client."""
+        client = MCPToolClient(base_url="http://localhost:8000")
+        client._production_session_id = "test-session"
+        http_client = AsyncMock()
+        client._http_client = http_client
+
+        with patch.object(
+            client,
+            "_production_mcp_request",
+            new=AsyncMock(return_value={"result": {}}),
+        ) as request:
+            client.sync().close()
+
+        request.assert_awaited_once_with(
+            "openenv/session/close", {"session_id": "test-session"}
+        )
+        http_client.aclose.assert_awaited_once_with()
+        assert client._production_session_id is None
+        assert client._http_client is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_session_close_still_releases_http_and_provider(
+        self, clean_env
+    ):
+        """Cancellation must not bypass later HTTP and provider cleanup."""
+
+        class Provider:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        close_started = asyncio.Event()
+
+        async def slow_session_close(*_args, **_kwargs):
+            close_started.set()
+            await asyncio.sleep(10)
+
+        provider = Provider()
+        client = MCPToolClient(
+            base_url="http://localhost:8000",
+            provider=provider,
+        )
+        client._production_session_id = "test-session"
+        http_client = AsyncMock()
+        client._http_client = http_client
+
+        with patch.object(
+            client, "_production_mcp_request", side_effect=slow_session_close
+        ):
+            close_call = asyncio.create_task(client._close_async())
+            await close_started.wait()
+            close_call.cancel()
+            close_results = await asyncio.gather(close_call, return_exceptions=True)
+
+        assert len(close_results) == 1
+        assert isinstance(close_results[0], asyncio.CancelledError)
+        http_client.aclose.assert_awaited_once_with()
+        assert client._production_session_id is None
+        assert client._http_client is None
+        assert provider.stopped
 
 
 # ============================================================================

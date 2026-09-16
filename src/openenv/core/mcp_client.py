@@ -339,34 +339,39 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
             step_count=payload.get("step_count", 0),
         )
 
-    async def close(self) -> None:
+    async def _close_async(self) -> None:
         """
         Close client resources.
 
         In production MCP mode, this also closes the server-side persistent
         MCP session (best effort) before closing websocket/provider resources.
+
+        This overrides the internal coroutine so sync and async dispatch paths
+        share the same cleanup.
         """
-        if self._production_session_id is not None:
+        try:
+            if self._production_session_id is not None:
+                try:
+                    await self._production_mcp_request(
+                        "openenv/session/close",
+                        {"session_id": self._production_session_id},
+                    )
+                except Exception:
+                    # Best effort cleanup - do not mask normal close behavior
+                    pass
+                finally:
+                    self._production_session_id = None
+        finally:
             try:
-                await self._production_mcp_request(
-                    "openenv/session/close",
-                    {"session_id": self._production_session_id},
-                )
-            except Exception:
-                # Best effort cleanup - do not mask normal close behavior
-                pass
+                if self._http_client is not None:
+                    try:
+                        await self._http_client.aclose()
+                    except Exception:
+                        pass
+                    finally:
+                        self._http_client = None
             finally:
-                self._production_session_id = None
-
-        if self._http_client is not None:
-            try:
-                await self._http_client.aclose()
-            except Exception:
-                pass
-            finally:
-                self._http_client = None
-
-        await super().close()
+                await super()._close_async()
 
 
 class MCPToolClient(MCPClientBase):
