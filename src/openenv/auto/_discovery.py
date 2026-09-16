@@ -347,9 +347,19 @@ def _default_cache_file() -> Path:
     attacker-controlled import paths (`import_module` on a cached `client_module_path`).
     Per the XDG Base Directory specification, relative `XDG_CACHE_HOME` values are
     ignored so an untrusted working tree cannot supply a victim-owned cache file.
+    The fallback home must itself be absolute; otherwise discovery fails closed.
     """
     base = os.environ.get("XDG_CACHE_HOME")
-    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
+    if base and Path(base).is_absolute():
+        root = Path(base)
+    else:
+        home = Path.home()
+        if not home.is_absolute():
+            raise RuntimeError(
+                "discovery cache requires an absolute home directory when "
+                "XDG_CACHE_HOME is unset or relative"
+            )
+        root = home / ".cache"
     return root / "openenv" / "discovery_cache.json"
 
 
