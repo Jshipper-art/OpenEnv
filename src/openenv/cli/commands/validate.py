@@ -80,6 +80,14 @@ def _render_report(report: ValidationReport | dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _write_runtime_report(report: dict[str, Any], path: Path | None = None) -> str:
+    """Serialize the legacy runtime report without widening the public report API."""
+    payload = json.dumps(report, indent=2)
+    if path is not None:
+        path.write_text(payload + "\n")
+    return payload
+
+
 def validate(
     target: Annotated[
         str | None,
@@ -188,7 +196,7 @@ def validate(
             raise typer.Exit(EXIT_FAIL) from exc
 
         try:
-            report_json = write_report(report, output)
+            report_json = _write_runtime_report(report, output)
         except Exception as exc:
             typer.echo(f"Internal error: {exc}", err=True)
             raise typer.Exit(EXIT_INTERNAL) from exc
