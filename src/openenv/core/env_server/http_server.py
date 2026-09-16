@@ -1544,6 +1544,10 @@ all schema information needed to interact with the environment.
                             raise RuntimeError(
                                 f"Session {requested_session_id} is still initializing"
                             )
+                        if requested_session_id in self._session_pending_closes:
+                            raise RuntimeError(
+                                f"Session {requested_session_id} is closing"
+                            )
                         if requested_session_id in self._session_websocket_attachments:
                             raise RuntimeError(
                                 f"Session {requested_session_id} already has "

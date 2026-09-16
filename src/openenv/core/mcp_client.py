@@ -233,8 +233,13 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
                         await super()._connect_async()
                     finally:
                         self._ws_url = original_ws_url
-                except Exception:
-                    await self.close()
+                except BaseException:
+                    # CancelledError is a BaseException: cleanup must still run
+                    # after session create so capacity is not leaked.
+                    try:
+                        await asyncio.shield(self.close())
+                    except Exception:
+                        pass
                     raise
             return self
 

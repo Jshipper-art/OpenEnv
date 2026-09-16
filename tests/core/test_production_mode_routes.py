@@ -889,6 +889,40 @@ class TestHTTPMCPSessionLifecycle:
         )
         assert close_response.json()["result"]["closed"] is True
 
+    def test_websocket_cannot_attach_while_session_close_is_pending(self, app):
+        """Pending closes refuse reattach so delayed destroy cannot race a new WS."""
+        client = TestClient(app)
+        create_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/create",
+                "params": {},
+                "id": 1,
+            },
+        )
+        session_id = create_response.json()["result"]["session_id"]
+
+        with client.websocket_connect(f"/ws?session_id={session_id}") as websocket:
+            close_response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "openenv/session/close",
+                    "params": {"session_id": session_id},
+                    "id": 2,
+                },
+            )
+            assert close_response.json()["result"]["closing"] is True
+
+            with client.websocket_connect(
+                f"/ws?session_id={session_id}"
+            ) as second_socket:
+                error_response = second_socket.receive_json()
+                assert "is closing" in error_response["data"]["message"]
+
+            websocket.send_json({"type": "close"})
+
     def test_websocket_still_destroys_its_own_session(self, app):
         """A WebSocket-created session is destroyed when the socket closes."""
         client = TestClient(app)

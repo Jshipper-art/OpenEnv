@@ -21,6 +21,7 @@ Test coverage:
 - Environment: Code mode with mode-aware tool registration
 """
 
+import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -462,6 +463,41 @@ class TestModeBehavior:
             await client.close()
 
         assert teardown_events[:2] == ["websocket", "session"]
+
+    @pytest.mark.asyncio
+    async def test_production_connect_cancellation_closes_allocated_session(
+        self, clean_env
+    ):
+        """Cancelled WebSocket connect still releases the HTTP MCP session."""
+        client = MCPToolClient(base_url="http://localhost:8000", mode="production")
+        client._ws_url = "ws://localhost:8000/ws"
+        close_calls = []
+
+        async def ensure_session():
+            client._production_session_id = "cancelled-session"
+            return "cancelled-session"
+
+        async def connect(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        async def close(*_args, **_kwargs):
+            close_calls.append(client._production_session_id)
+
+        with (
+            patch.object(client, "_start_provider_if_needed"),
+            patch.object(
+                client, "_ensure_production_session", side_effect=ensure_session
+            ),
+            patch(
+                "openenv.core.env_client.EnvClient._connect_async",
+                side_effect=connect,
+            ),
+            patch.object(client, "close", new=close),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await client._connect_async()
+
+        assert close_calls == ["cancelled-session"]
 
 
 # ============================================================================
