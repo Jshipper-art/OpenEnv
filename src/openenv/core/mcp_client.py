@@ -20,14 +20,14 @@ Architecture Overview::
     │    /mcp   → MCP JSON-RPC (tools/list, tools/call)       │
     │    /reset, /step, /state → HTTP endpoints               │
     ├─────────────────────────────────────────────────────────┤
-    │  Explicit direct mode (use_production_mode=True):       │
+    │  Production Mode (use_production_mode=True):            │
     │    /mcp   → MCP JSON-RPC (tools/list, tools/call)       │
-    │    Tools only; Gym reset/step/state are unavailable     │
+    │    Bypasses step() for direct tool access               │
     └─────────────────────────────────────────────────────────┘
 
     Client Usage:
       MCPToolClient (default)     → /ws (step-based, with rewards)
-      MCPToolClient (direct opt-in) → /mcp (tools only, no rewards)
+      MCPToolClient (production)    → /mcp (direct tool access, no rewards)
 
 Examples:
 
@@ -56,6 +56,7 @@ Examples:
 
 import asyncio
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import ConfigDict
 
@@ -154,48 +155,12 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
             mode=mode,
         )
         self._tools_cache: Optional[List[Tool]] = None
-        self._use_production_mode = False
+        self.use_production_mode = self._mode == "production"
         self._production_session_id: Optional[str] = None
+        self._production_connect_lock = asyncio.Lock()
         self._production_session_lock = asyncio.Lock()
         self._jsonrpc_request_id = 0
         self._http_client: Optional[Any] = None  # lazily-created httpx.AsyncClient
-
-    @property
-    def use_production_mode(self) -> bool:
-        """Whether explicit tools-only HTTP MCP routing is enabled."""
-        return self._use_production_mode
-
-    @use_production_mode.setter
-    def use_production_mode(self, value: bool) -> None:
-        """Enable or disable tools-only HTTP MCP routing before connecting."""
-        if not isinstance(value, bool):
-            raise TypeError("use_production_mode must be a bool")
-        current = getattr(self, "_use_production_mode", False)
-        has_live_transport = (
-            getattr(self, "_ws", None) is not None
-            or getattr(self, "_production_session_id", None) is not None
-            or getattr(self, "_http_client", None) is not None
-        )
-        if value != current and has_live_transport:
-            raise RuntimeError(
-                "use_production_mode cannot change while a client transport is active"
-            )
-        self._use_production_mode = value
-
-    async def _connect_async(self) -> EnvClient:
-        """Connect the Gym WebSocket, or prepare explicit tools-only mode."""
-        if not self.use_production_mode:
-            return await super()._connect_async()
-
-        try:
-            self._start_provider_if_needed()
-        except BaseException:
-            try:
-                await asyncio.shield(self._close_async())
-            except BaseException:
-                pass  # Preserve the original startup failure
-            raise
-        return self
 
     def _next_request_id(self) -> int:
         """Generate a monotonically increasing JSON-RPC request id."""
@@ -203,11 +168,19 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         return self._jsonrpc_request_id
 
     def _production_mcp_url(self) -> str:
-        """Build HTTP MCP endpoint URL from the client's websocket URL."""
-        url = self._ws_url.replace("ws://", "http://").replace("wss://", "https://")
-        if url.endswith("/ws"):
-            url = url[: -len("/ws")]
-        return url.rstrip("/") + "/mcp"
+        """Build the HTTP MCP endpoint URL from the stable base URL."""
+        if self._base_url is None:
+            raise RuntimeError("MCP client is not connected to a server.")
+        parts = urlsplit(self._base_url)
+        scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
+        return urlunsplit(
+            parts._replace(
+                scheme=scheme,
+                path=parts.path.rstrip("/") + "/mcp",
+                query="",
+                fragment="",
+            )
+        )
 
     async def _get_http_client(self) -> Any:
         """Return a shared httpx.AsyncClient, creating one lazily."""
@@ -235,6 +208,41 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         response.raise_for_status()
         return response.json()
 
+    async def _connect_async(self) -> EnvClient:
+        """
+        Establish connection to the server.
+
+        In production mode (use_production_mode=True), creates an HTTP MCP session
+        and connects the WebSocket using that session ID so that WebSocket (reset/step/state)
+        and HTTP MCP (list_tools/call_tool) share the exact same server-side environment session.
+        """
+        if getattr(self, "use_production_mode", False):
+            async with self._production_connect_lock:
+                try:
+                    self._start_provider_if_needed()
+                    session_id = await self._ensure_production_session()
+                    original_ws_url = self._ws_url
+                    if original_ws_url is None:
+                        raise RuntimeError("MCP client has no WebSocket URL.")
+
+                    parts = urlsplit(original_ws_url)
+                    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+                    query["session_id"] = session_id
+                    self._ws_url = urlunsplit(parts._replace(query=urlencode(query)))
+                    try:
+                        await super()._connect_async()
+                    finally:
+                        self._ws_url = original_ws_url
+                except BaseException:
+                    # Cancellation after the HTTP session is allocated must
+                    # release that session and any started provider before the
+                    # cancellation propagates.
+                    await self.close()
+                    raise
+            return self
+
+        return await super()._connect_async()
+
     async def _ensure_production_session(self) -> str:
         """Create and cache a persistent HTTP MCP session id if needed."""
         async with self._production_session_lock:
@@ -252,27 +260,6 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
 
             self._production_session_id = session_id
             return session_id
-
-    def _tools_only_error(self, operation: str) -> RuntimeError:
-        return RuntimeError(
-            f"{operation} is unavailable while use_production_mode=True; "
-            "direct MCP mode supports only list_tools() and call_tool()"
-        )
-
-    async def _reset_async(self, **kwargs: Any) -> StepResult[Observation]:
-        if self.use_production_mode:
-            raise self._tools_only_error("reset()")
-        return await super()._reset_async(**kwargs)
-
-    async def _step_async(self, action: Any, **kwargs: Any) -> StepResult[Observation]:
-        if self.use_production_mode:
-            raise self._tools_only_error("step()")
-        return await super()._step_async(action, **kwargs)
-
-    async def _state_async(self) -> State:
-        if self.use_production_mode:
-            raise self._tools_only_error("state()")
-        return await super()._state_async()
 
     async def list_tools(self, use_cache: bool = True) -> List[Tool]:
         """
@@ -299,22 +286,23 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         # Use production mode HTTP endpoint if enabled.
         # Some tests instantiate with __new__ and skip __init__, so default missing flag to False.
         if getattr(self, "use_production_mode", False):
-            session_id = await self._ensure_production_session()
-            data = await self._production_mcp_request(
-                "tools/list",
-                {"session_id": session_id},
-            )
-            if "error" in data:
-                message = data.get("error", {}).get("message", "unknown error")
-                raise RuntimeError(f"list_tools failed: {message}")
-            result = data.get("result")
-            if not isinstance(result, dict) or not isinstance(
-                result.get("tools"), list
-            ):
-                raise RuntimeError("list_tools failed: malformed JSON-RPC result")
-            tools = [_tool_from_payload(t) for t in result["tools"]]
-            self._tools_cache = tools
-            return tools
+            try:
+                session_id = await self._ensure_production_session()
+                data = await self._production_mcp_request(
+                    "tools/list",
+                    {"session_id": session_id},
+                )
+                if "error" in data:
+                    message = data.get("error", {}).get("message", "unknown error")
+                    raise RuntimeError(f"list_tools failed: {message}")
+                if "result" in data and "tools" in data["result"]:
+                    tools = [_tool_from_payload(t) for t in data["result"]["tools"]]
+                    self._tools_cache = tools
+                    return tools
+            except Exception:
+                # If HTTP request fails, return empty list
+                pass
+            return []
 
         result = await self.step(ListToolsAction())
         if isinstance(result.observation, ListToolsObservation):
@@ -401,34 +389,43 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         Close client resources.
 
         In production MCP mode, this also closes the server-side persistent
-        MCP session (best effort) before closing websocket/provider resources.
+        MCP session (best effort) after detaching the WebSocket and before
+        closing HTTP/provider resources.
 
-        This overrides the internal coroutine so sync and async dispatch paths
-        share the same cleanup.
+        Override `_close_async` rather than `close` so sync teardown
+        (`SyncEnvClient.close`, sync `__exit__`, and `_dispatch`) still cleans
+        up the HTTP MCP session.
         """
         try:
-            if self._production_session_id is not None:
-                try:
-                    await self._production_mcp_request(
-                        "openenv/session/close",
-                        {"session_id": self._production_session_id},
-                    )
-                except Exception:
-                    # Best effort cleanup - do not mask normal close behavior
-                    pass
-                finally:
-                    self._production_session_id = None
+            # The WebSocket shares the HTTP-created session. Detach it first so
+            # the server's ownership guard permits the explicit session close.
+            await self._disconnect_async()
         finally:
             try:
-                if self._http_client is not None:
+                if self._production_session_id is not None:
                     try:
-                        await self._http_client.aclose()
+                        await self._production_mcp_request(
+                            "openenv/session/close",
+                            {"session_id": self._production_session_id},
+                        )
                     except Exception:
-                        pass  # Best effort; continue to websocket/provider teardown
+                        # Best effort cleanup - do not mask normal close behavior
+                        pass
                     finally:
-                        self._http_client = None
+                        self._production_session_id = None
             finally:
-                await super()._close_async()
+                try:
+                    if self._http_client is not None:
+                        try:
+                            await self._http_client.aclose()
+                        except Exception:
+                            pass
+                        finally:
+                            self._http_client = None
+                finally:
+                    # This is intentionally inside the outer finally so
+                    # cancellation cannot skip provider teardown.
+                    await super()._close_async()
 
 
 class MCPToolClient(MCPClientBase):

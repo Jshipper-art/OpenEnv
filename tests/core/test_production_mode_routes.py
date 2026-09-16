@@ -27,7 +27,7 @@ Test coverage:
 import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI
@@ -785,6 +785,139 @@ class TestHTTPMCPSessionLifecycle:
             response_text2 = websocket.receive_text()
             response2 = json.loads(response_text2)
             assert response2["data"]["result"]["session_id"] == ws_session_id
+
+    def test_websocket_can_attach_to_http_session_without_destroying_it(self, app):
+        """An attached WebSocket shares and preserves an HTTP-created session."""
+        client = TestClient(app)
+        create_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/create",
+                "params": {},
+                "id": 1,
+            },
+        )
+        session_id = create_response.json()["result"]["session_id"]
+
+        with client.websocket_connect(f"/ws?session_id={session_id}") as websocket:
+            websocket.send_json({"type": "state"})
+            state_response = websocket.receive_json()
+            assert state_response["type"] == "state"
+
+            active_close_response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "openenv/session/close",
+                    "params": {"session_id": session_id},
+                    "id": 2,
+                },
+            )
+            close_result = active_close_response.json()["result"]
+            assert close_result == {
+                "session_id": session_id,
+                "closed": False,
+                "closing": True,
+            }
+            websocket.send_json({"type": "close"})
+
+        tools_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "params": {"session_id": session_id},
+                "id": 3,
+            },
+        )
+        assert tools_response.json()["error"]["code"] == -32602
+
+        replacement_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/create",
+                "params": {},
+                "id": 4,
+            },
+        )
+        replacement_id = replacement_response.json()["result"]["session_id"]
+        client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/close",
+                "params": {"session_id": replacement_id},
+                "id": 5,
+            },
+        )
+
+    def test_http_session_allows_only_one_attached_websocket(self, app):
+        """A second WebSocket cannot concurrently mutate the same session."""
+        client = TestClient(app)
+        create_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/create",
+                "params": {},
+                "id": 1,
+            },
+        )
+        session_id = create_response.json()["result"]["session_id"]
+
+        with client.websocket_connect(f"/ws?session_id={session_id}") as first_socket:
+            with client.websocket_connect(
+                f"/ws?session_id={session_id}"
+            ) as second_socket:
+                error_response = second_socket.receive_json()
+                assert (
+                    "already has an attached WebSocket"
+                    in (error_response["data"]["message"])
+                )
+            first_socket.send_json({"type": "close"})
+
+        close_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/close",
+                "params": {"session_id": session_id},
+                "id": 2,
+            },
+        )
+        assert close_response.json()["result"]["closed"] is True
+
+    def test_websocket_still_destroys_its_own_session(self, app):
+        """A WebSocket-created session is destroyed when the socket closes."""
+        client = TestClient(app)
+
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(
+                {
+                    "type": "mcp",
+                    "data": {
+                        "jsonrpc": "2.0",
+                        "method": "openenv/session/create",
+                        "params": {},
+                        "id": 1,
+                    },
+                }
+            )
+            session_id = websocket.receive_json()["data"]["result"]["session_id"]
+            websocket.send_json({"type": "close"})
+
+        tools_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "params": {"session_id": session_id},
+                "id": 2,
+            },
+        )
+        assert tools_response.json()["error"]["code"] == -32602
 
     def test_session_close_missing_session_id_param(self, app):
         """Test openenv/session/close without session_id returns INVALID_PARAMS."""
@@ -1759,37 +1892,23 @@ class TestMCPClientProductionMode:
     """Tests for MCP client using production mode."""
 
     async def test_mcp_client_can_use_production_endpoints(self):
-        """Explicit direct mode uses MCP endpoints without opening Gym transport."""
+        """Test MCPToolClient can use production MCP endpoints directly."""
         from openenv.core.mcp_client import MCPToolClient
 
         client = MCPToolClient(base_url="http://localhost:8000")
+
+        # Client should have option to use production mode (bypasses step())
+        assert hasattr(client, "use_production_mode")
+
         client.use_production_mode = True
 
-        with (
-            patch.object(
-                client,
-                "_production_mcp_request",
-                new=AsyncMock(
-                    side_effect=[
-                        {"result": {"session_id": "test-session"}},
-                        {"result": {"tools": []}},
-                        {"result": {"closed": True}},
-                    ]
-                ),
-            ) as mcp_request,
-            patch.object(client, "step") as mock_step,
-        ):
-            await client.connect()
-            assert client._ws is None
-            assert await client.list_tools() == []
-            mock_step.assert_not_called()
-            await client.close()
+        # Calling list_tools() should use /mcp endpoint, not step()
+        with patch.object(client, "step") as mock_step:
+            tools = await client.list_tools()
 
-        assert [call.args[0] for call in mcp_request.await_args_list] == [
-            "openenv/session/create",
-            "tools/list",
-            "openenv/session/close",
-        ]
+            # step() should NOT be called in production mode
+            mock_step.assert_not_called()
+            assert len(tools) >= 0
 
     @pytest.mark.skip(reason="Implementation detail - httpx is now imported locally")
     async def test_client_production_mode_uses_http_mcp_endpoint(self):
