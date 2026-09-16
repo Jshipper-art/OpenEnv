@@ -594,9 +594,7 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     ) -> asyncio.Task[None]:
         """Schedule and track a socket close until its handshake finishes."""
         close_coro = (
-            _best_effort_graceful_close(ws)
-            if notify_server
-            else _best_effort_close(ws)
+            _best_effort_graceful_close(ws) if notify_server else _best_effort_close(ws)
         )
         close_task = asyncio.create_task(close_coro)
         self._pending_close_tasks.add(close_task)
