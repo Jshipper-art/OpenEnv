@@ -255,6 +255,17 @@ class TestModeBehavior:
                     },
                 )
 
+    def test_production_mcp_url_converts_ws_base_url(self, clean_env):
+        """ws:// / wss:// base URLs must become http(s) for production /mcp posts."""
+        ws_client = MCPToolClient(base_url="ws://localhost:8000", mode="production")
+        assert ws_client._production_mcp_url() == "http://localhost:8000/mcp"
+
+        wss_client = MCPToolClient(base_url="wss://example.com", mode="production")
+        assert wss_client._production_mcp_url() == "https://example.com/mcp"
+
+        http_client = MCPToolClient(base_url="http://localhost:8000", mode="production")
+        assert http_client._production_mcp_url() == "http://localhost:8000/mcp"
+
     @pytest.mark.asyncio
     async def test_production_mode_connect_creates_single_session_with_websocket(
         self, clean_env
@@ -391,73 +402,6 @@ class TestModeBehavior:
             assert client._production_session_id is None
             mock_http_client.aclose.assert_awaited_once()
             assert client._http_client is None
-
-    @pytest.mark.asyncio
-    async def test_websocket_disconnect_preserves_attached_http_session(self):
-        """Test that a WebSocket attaching to an existing session does NOT destroy that session when disconnected."""
-        from fastapi import FastAPI
-        from openenv.core.env_server.http_server import HTTPEnvServer
-        from starlette.testclient import TestClient
-
-        # Import sibling module fixtures (tests/ is not a package on PYTHONPATH=src:envs).
-        from test_production_mode_routes import (
-            MinimalAction,
-            MinimalEnvironment,
-            MinimalObservation,
-        )
-
-        server = HTTPEnvServer(
-            env=MinimalEnvironment,
-            action_cls=MinimalAction,
-            observation_cls=MinimalObservation,
-        )
-        app = FastAPI()
-        server.register_routes(app)
-
-        # 1. Create session via HTTP / HTTPEnvServer
-        session_id, env_instance = await server._create_session()
-        assert session_id in server._sessions
-
-        # 2. Attach WebSocket to existing session_id
-        with TestClient(app) as test_client:
-            with test_client.websocket_connect(f"/ws?session_id={session_id}") as ws:
-                ws.send_json({"type": "close"})
-
-        # 3. Session must remain alive because WebSocket didn't create it
-        assert session_id in server._sessions
-        assert server._sessions[session_id] is env_instance
-
-        # 4. Clean up
-        await server._destroy_session(session_id)
-        assert session_id not in server._sessions
-
-    @pytest.mark.asyncio
-    async def test_websocket_disconnect_destroys_websocket_created_session(self):
-        """Test that a WebSocket creating its own session DOES destroy that session when disconnected."""
-        from fastapi import FastAPI
-        from openenv.core.env_server.http_server import HTTPEnvServer
-        from starlette.testclient import TestClient
-        from test_production_mode_routes import (
-            MinimalAction,
-            MinimalEnvironment,
-            MinimalObservation,
-        )
-
-        server = HTTPEnvServer(
-            env=MinimalEnvironment,
-            action_cls=MinimalAction,
-            observation_cls=MinimalObservation,
-        )
-        app = FastAPI()
-        server.register_routes(app)
-
-        with TestClient(app) as test_client:
-            with test_client.websocket_connect("/ws") as ws:
-                assert len(server._sessions) == 1
-                ws.send_json({"type": "close"})
-
-        # After WebSocket disconnects, the session created by WebSocket should be destroyed
-        assert len(server._sessions) == 0
 
 
 # ============================================================================

@@ -166,14 +166,16 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         return self._jsonrpc_request_id
 
     def _production_mcp_url(self) -> str:
-        """Build HTTP MCP endpoint URL from the client's websocket URL."""
-        url = self._ws_url.replace("ws://", "http://").replace("wss://", "https://")
-        # Strip query/fragment so a temporary `?session_id=` rewrite on `_ws_url`
-        # cannot poison session create/close posts to `/mcp`.
-        url = url.split("?", 1)[0].split("#", 1)[0]
-        if url.endswith("/ws"):
-            url = url[: -len("/ws")]
-        return url.rstrip("/") + "/mcp"
+        """Build the HTTP MCP endpoint URL from the stable base URL."""
+        if self._base_url is None:
+            raise RuntimeError("MCP client is not connected to a server.")
+        # `_base_url` may be `ws://` / `wss://` (documented for EnvClient); httpx needs HTTP.
+        url = (
+            self._base_url.replace("ws://", "http://")
+            .replace("wss://", "https://")
+            .rstrip("/")
+        )
+        return url + "/mcp"
 
     async def _get_http_client(self) -> Any:
         """Return a shared httpx.AsyncClient, creating one lazily."""
@@ -205,10 +207,9 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         """
         Establish connection to the server.
 
-        In production mode (`use_production_mode=True`), create a persistent HTTP
-        MCP session first, then open the WebSocket with that `session_id` so
-        `reset` / `step` / `state` and `list_tools` / `call_tool` share one
-        server-side environment (avoids dual-session capacity failures).
+        In production mode (use_production_mode=True), creates an HTTP MCP session
+        and connects the WebSocket using that session ID so that WebSocket (reset/step/state)
+        and HTTP MCP (list_tools/call_tool) share the exact same server-side environment session.
         """
         if getattr(self, "use_production_mode", False):
             try:
@@ -221,7 +222,6 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
                 try:
                     await super()._connect_async()
                 finally:
-                    # Always restore so failed connect / close still posts to `/mcp`.
                     self._ws_url = original_ws_url
             except Exception:
                 await self.close()

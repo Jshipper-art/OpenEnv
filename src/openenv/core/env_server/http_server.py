@@ -134,7 +134,6 @@ from .exceptions import (
     ConcurrencyConfigurationError,
     EnvironmentFactoryError,
     SessionCapacityError,
-    SessionNotFoundError,
 )
 
 
@@ -1488,15 +1487,11 @@ all schema information needed to interact with the environment.
             """
             WebSocket endpoint for persistent environment sessions.
 
-            By default each WebSocket connection gets its own environment instance.
-            Pass `?session_id=<id>` to attach to an existing HTTP MCP session so
-            Gym (`reset`/`step`/`state`) and tools share one server-side env.
-            Attached sockets do not destroy the session on disconnect; only
-            WebSocket-created sessions are cleaned up here.
-
-            The client sends WSResetMessage, WSStepMessage, WSStateMessage, or
-            WSCloseMessage; the server responds with WSObservationResponse,
-            WSStateResponse, or WSErrorResponse.
+            By default, each WebSocket connection gets its own environment instance.
+            A client can instead attach to an existing HTTP MCP session by passing its
+            session ID in the query string. The client sends WSResetMessage,
+            WSStepMessage, WSStateMessage, or WSCloseMessage; the server responds with
+            WSObservationResponse, WSStateResponse, or WSErrorResponse.
             """
             await websocket.accept()
 
@@ -1507,37 +1502,40 @@ all schema information needed to interact with the environment.
             try:
                 requested_session_id = websocket.query_params.get("session_id")
                 if requested_session_id:
-                    # Attach to an existing HTTP MCP (or other) session.
                     async with self._session_lock:
-                        existing = self._sessions.get(requested_session_id, _MISSING)
-                    if existing is _MISSING:
-                        raise SessionNotFoundError(requested_session_id)
-                    if existing is None:
+                        attached_env = self._sessions.get(
+                            requested_session_id, _MISSING
+                        )
+                    if attached_env is _MISSING:
                         raise RuntimeError(
-                            f"Session {requested_session_id} is still initializing; "
-                            "retry shortly"
+                            f"Unknown session_id: {requested_session_id}"
+                        )
+                    if attached_env is None:
+                        raise RuntimeError(
+                            f"Session {requested_session_id} is still initializing"
                         )
                     session_id = requested_session_id
-                    session_env = existing
+                    session_env = attached_env
+                    self._update_session_activity(session_id)
                 else:
-                    # Create session with dedicated environment
                     session_id, session_env = await self._create_session()
                     owns_session = True
-                    if session_env is None:
-                        raise RuntimeError(
-                            "Session environment not initialized for websocket"
-                        )
 
-                # Keep MCP session open for WebSocket-owned sessions (attached
-                # sessions already hold MCP via `_session_stacks`).
+                if session_env is None:
+                    raise RuntimeError(
+                        "Session environment not initialized for websocket"
+                    )
+
+                # Keep MCP session open for entire websocket lifetime
+                # (avoids reconnect overhead on every message)
+
                 async with AsyncExitStack() as stack:
-                    if owns_session:
-                        mcp_session_factory = getattr(session_env, "mcp_session", None)
-                        if callable(mcp_session_factory):
-                            mcp_session_cm = cast(
-                                AsyncContextManager[Any], mcp_session_factory()
-                            )
-                            await stack.enter_async_context(mcp_session_cm)
+                    mcp_session_factory = getattr(session_env, "mcp_session", None)
+                    if owns_session and callable(mcp_session_factory):
+                        mcp_session_cm = cast(
+                            AsyncContextManager[Any], mcp_session_factory()
+                        )
+                        await stack.enter_async_context(mcp_session_cm)
 
                     while True:
                         # Receive message from client
@@ -1706,20 +1704,13 @@ all schema information needed to interact with the environment.
                     }
                 )
                 await websocket.send_text(error_resp.model_dump_json())
-            except SessionNotFoundError as e:
-                error_resp = WSErrorResponse(
-                    data={"message": str(e), "code": WSErrorCode.SESSION_ERROR}
-                )
-                await websocket.send_text(error_resp.model_dump_json())
             except Exception as e:
                 error_resp = WSErrorResponse(
                     data={"message": str(e), "code": WSErrorCode.SESSION_ERROR}
                 )
                 await websocket.send_text(error_resp.model_dump_json())
             finally:
-                # Only destroy sessions this WebSocket created. Attached HTTP MCP
-                # sessions are closed via `openenv/session/close` on the client.
-                if session_id and owns_session:
+                if owns_session and session_id:
                     await self._destroy_session(session_id)
                 try:
                     await websocket.close()
