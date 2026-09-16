@@ -991,18 +991,20 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         If this client was created via from_docker_image() or from_env(),
         this will also stop and remove the associated container/process.
         """
-        for child in list(self._child_clients):
-            with suppress(Exception):
-                await child.close()
-        self._child_clients.clear()
-
         try:
             try:
+                # Parent teardown must not depend on every child finishing.
+                # Cancellation while awaiting a child still falls through to
+                # detach/close this client's socket and stop its provider.
+                for child in list(self._child_clients):
+                    with suppress(Exception):
+                        await child.close()
                 # A real close waits out backgrounded closes, but shield them
                 # from cancellation so their socket handshakes aren't
                 # abandoned midway.
                 await self._drain_pending_close_tasks()
             finally:
+                self._child_clients.clear()
                 # Run even when pending-close draining is cancelled. A client
                 # may already have reconnected, and that current socket must
                 # not remain cached or open during teardown.

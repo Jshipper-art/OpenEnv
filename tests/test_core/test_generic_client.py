@@ -1839,6 +1839,56 @@ class TestForeignLoopReconnect:
         mock_connect.assert_called_once()
         await client._close_async()
 
+    @pytest.mark.asyncio
+    async def test_cancelled_child_close_still_tears_down_parent(self):
+        """Child cancellation must not skip the parent's socket and provider."""
+
+        class FakeRuntimeProvider:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        child_close_started = asyncio.Event()
+
+        class SlowChild:
+            async def close(self):
+                child_close_started.set()
+                await asyncio.Event().wait()
+
+        class CurrentSocket:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def close(self):
+                self.state = State.CLOSED
+
+        provider = FakeRuntimeProvider()
+        client = GenericEnvClient(provider=provider)
+        client._base_url = "http://localhost:8000"
+        client._ws_url = "ws://localhost:8000/ws"
+        client._child_clients.append(SlowChild())
+
+        current_ws = CurrentSocket()
+        client._ws = current_ws
+        client._ws_loop = asyncio.get_running_loop()
+
+        close_task = asyncio.create_task(client._close_async())
+        await child_close_started.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        assert client._child_clients == []
+        assert client._ws is None
+        assert current_ws.state == State.CLOSED
+        assert provider.stopped
+        assert client._base_url is None
+        assert client._ws_url is None
+
 
 # ============================================================================
 # Integration Tests (require running server)
