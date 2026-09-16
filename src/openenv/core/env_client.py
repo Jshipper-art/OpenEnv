@@ -255,6 +255,15 @@ async def _best_effort_close(ws: ClientConnection) -> None:
         pass  # Best effort
 
 
+async def _best_effort_disconnect(ws: ClientConnection) -> None:
+    """Notify the server and close a socket despite caller cancellation."""
+    try:
+        await ws.send(json.dumps({"type": "close"}))
+    except (Exception, asyncio.CancelledError):
+        pass  # Best effort
+    await _best_effort_close(ws)
+
+
 class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     """
     Async environment client for persistent sessions.
@@ -590,16 +599,15 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             self._ws = None
             self._ws_loop = None
             same_loop = ws_loop is asyncio.get_running_loop()
-            try:
-                if same_loop:
-                    await ws.send(json.dumps({"type": "close"}))
-            except Exception:
-                pass  # Best effort
-            try:
-                if same_loop:
-                    await ws.close()
-            except Exception:
-                pass
+            if same_loop:
+                # Keep a strong, drainable reference to the entire handshake.
+                # If this caller is cancelled, the task continues in the
+                # background and a later reconnect waits for it to release the
+                # old server-side session's capacity slot.
+                close_task = asyncio.ensure_future(_best_effort_disconnect(ws))
+                self._pending_close_tasks.add(close_task)
+                close_task.add_done_callback(self._pending_close_tasks.discard)
+                await asyncio.shield(close_task)
 
     async def _drain_pending_close_tasks(self) -> None:
         """Wait for background socket closes owned by the current event loop.

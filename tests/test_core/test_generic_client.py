@@ -1785,6 +1785,60 @@ class TestForeignLoopReconnect:
         await pending
         assert dropped_ws.state == State.CLOSED
 
+    @pytest.mark.asyncio
+    async def test_cancelled_current_close_is_drained_before_reconnect(self):
+        """A cancelled active handshake must still release session capacity."""
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+
+        class SlowCurrentSocket:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def close(self):
+                close_started.set()
+                await release_close.wait()
+                self.state = State.CLOSED
+
+        client = GenericEnvClient(base_url="http://localhost:8000")
+        current_ws = SlowCurrentSocket()
+        client._ws = current_ws
+        client._ws_loop = asyncio.get_running_loop()
+
+        close_task = asyncio.create_task(client._close_async())
+        await close_started.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        assert client._ws is None
+        assert current_ws.state == State.OPEN
+        assert any(not task.done() for task in client._pending_close_tasks)
+
+        replacement_ws = AsyncMock()
+        replacement_ws.state = State.OPEN
+
+        async def fake_ws_connect(*args, **kwargs):
+            return replacement_ws
+
+        with patch(
+            "openenv.core.env_client.ws_connect", side_effect=fake_ws_connect
+        ) as mock_connect:
+            reconnect = asyncio.create_task(client._connect_async())
+            await asyncio.sleep(0)
+            assert not reconnect.done()
+            mock_connect.assert_not_called()
+
+            release_close.set()
+            await asyncio.wait_for(reconnect, timeout=1)
+
+        assert current_ws.state == State.CLOSED
+        assert client._ws is replacement_ws
+        mock_connect.assert_called_once()
+        await client._close_async()
+
 
 # ============================================================================
 # Integration Tests (require running server)
