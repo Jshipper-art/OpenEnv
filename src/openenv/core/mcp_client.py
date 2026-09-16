@@ -202,16 +202,23 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         """
         Establish connection to the server.
 
-        In production mode (`use_production_mode=True`), open the WebSocket used
-        by `reset` / `step` / `state` and create a persistent HTTP MCP session
-        for `list_tools` / `call_tool`. Tool calls bypass `step()` over `/mcp`,
-        but the Gym lifecycle still requires `/ws` until production routing
-        covers those methods end-to-end.
+        In production mode (`use_production_mode=True`), create an HTTP MCP
+        session first and connect the WebSocket with that `session_id` so
+        Gym (`reset` / `step` / `state`) and tool (`list_tools` / `call_tool`)
+        traffic share one server-side environment session.
         """
         if getattr(self, "use_production_mode", False):
             try:
-                await super()._connect_async()
-                await self._ensure_production_session()
+                self._start_provider_if_needed()
+                session_id = await self._ensure_production_session()
+                original_ws_url = self._ws_url
+                if self._ws_url and "session_id=" not in self._ws_url:
+                    sep = "&" if "?" in self._ws_url else "?"
+                    self._ws_url = f"{self._ws_url}{sep}session_id={session_id}"
+                try:
+                    await super()._connect_async()
+                finally:
+                    self._ws_url = original_ws_url
             except Exception:
                 await self.close()
                 raise

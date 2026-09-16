@@ -256,15 +256,12 @@ class TestModeBehavior:
                 )
 
     @pytest.mark.asyncio
-    async def test_production_mode_connect_opens_websocket_and_http_session(
+    async def test_production_mode_connect_creates_single_session_with_websocket(
         self, clean_env
     ):
-        """Production connect must open WebSocket (reset/step/state) and HTTP MCP session."""
+        """Production connect creates one HTTP MCP session and attaches `/ws` to it."""
         client = MCPToolClient(base_url="http://localhost:8000", mode="production")
         assert client.use_production_mode is True
-
-        mock_ws = MagicMock()
-        mock_ws.closed = False
 
         with patch.object(
             client,
@@ -275,14 +272,12 @@ class TestModeBehavior:
             ],
         ) as mock_mcp_request:
             with patch(
-                "openenv.core.env_client.ws_connect",
-                new_callable=AsyncMock,
-                return_value=mock_ws,
+                "openenv.core.env_client.ws_connect", new_callable=AsyncMock
             ) as mock_ws_connect:
                 await client.connect()
 
                 mock_ws_connect.assert_called_once()
-                assert client._ws is mock_ws
+                assert "session_id=test-session" in mock_ws_connect.call_args[0][0]
                 assert client._production_session_id == "test-session"
                 mock_mcp_request.assert_called_once_with("openenv/session/create")
 
@@ -300,65 +295,187 @@ class TestModeBehavior:
 
     @pytest.mark.asyncio
     async def test_production_mode_connect_failure_cleans_up_resources(self, clean_env):
-        """Test that failure during production mode connect() triggers client.close() cleanup."""
+        """Failure during production connect() must trigger client.close() cleanup."""
         client = MCPToolClient(base_url="http://localhost:8000", mode="production")
         assert client.use_production_mode is True
 
-        mock_ws = MagicMock()
-        mock_ws.closed = False
-        mock_ws.close = AsyncMock()
-
-        with patch(
-            "openenv.core.env_client.ws_connect",
-            new_callable=AsyncMock,
-            return_value=mock_ws,
+        with patch.object(
+            client,
+            "_ensure_production_session",
+            side_effect=RuntimeError("Session creation failed"),
         ):
-            with patch.object(
-                client,
-                "_ensure_production_session",
-                side_effect=RuntimeError("Session creation failed"),
-            ):
-                with patch.object(client, "close", wraps=client.close) as mock_close:
-                    with pytest.raises(RuntimeError, match="Session creation failed"):
-                        await client.connect()
+            with patch.object(client, "close", wraps=client.close) as mock_close:
+                with pytest.raises(RuntimeError, match="Session creation failed"):
+                    await client.connect()
 
-                    mock_close.assert_called_once()
+                mock_close.assert_called_once()
+
+    def test_production_mode_sync_close_closes_mcp_session(self, clean_env):
+        """Sync close must tear down the HTTP MCP session via `_close_async`."""
+        client = MCPToolClient(
+            base_url="http://localhost:8000", mode="production"
+        ).sync()
+        client._async._production_session_id = "test-session-sync"
+
+        mock_http_client = AsyncMock()
+        client._async._http_client = mock_http_client
+
+        with patch.object(
+            client._async,
+            "_production_mcp_request",
+            new_callable=AsyncMock,
+            return_value={"result": {"status": "closed"}},
+        ) as mock_mcp_req:
+            client.close()
+
+            mock_mcp_req.assert_awaited_once_with(
+                "openenv/session/close",
+                {"session_id": "test-session-sync"},
+            )
+            assert client._async._production_session_id is None
+            mock_http_client.aclose.assert_awaited_once()
+            assert client._async._http_client is None
+
+    def test_production_mode_sync_context_manager_closes_mcp_session(self, clean_env):
+        """Sync context-manager exit must close the HTTP MCP session."""
+        client = MCPToolClient(
+            base_url="http://localhost:8000", mode="production"
+        ).sync()
+        client._async._production_session_id = "test-session-context"
+
+        mock_http_client = AsyncMock()
+        client._async._http_client = mock_http_client
+
+        with patch.object(
+            client._async,
+            "_production_mcp_request",
+            new_callable=AsyncMock,
+            return_value={"result": {"status": "closed"}},
+        ) as mock_mcp_req:
+            with patch.object(client._async, "_connect_async", new_callable=AsyncMock):
+                with client:
+                    pass
+
+            mock_mcp_req.assert_awaited_once_with(
+                "openenv/session/close",
+                {"session_id": "test-session-context"},
+            )
+            assert client._async._production_session_id is None
+            mock_http_client.aclose.assert_awaited_once()
+            assert client._async._http_client is None
 
     @pytest.mark.asyncio
-    async def test_production_mode_sync_close_closes_mcp_session(self, clean_env):
-        """Sync close must tear down the HTTP MCP session via `_close_async`."""
+    async def test_production_mode_async_close_closes_mcp_session(self, clean_env):
+        """Async close must tear down the HTTP MCP session."""
         client = MCPToolClient(base_url="http://localhost:8000", mode="production")
-        assert client.use_production_mode is True
+        client._production_session_id = "test-session-async"
 
-        mock_ws = MagicMock()
-        mock_ws.closed = False
-        mock_ws.close = AsyncMock()
+        mock_http_client = AsyncMock()
+        client._http_client = mock_http_client
 
         with patch.object(
             client,
             "_production_mcp_request",
-            side_effect=[
-                {"result": {"session_id": "test-session"}},
-                {"result": {}},
-            ],
-        ) as mock_mcp_request:
-            with patch(
-                "openenv.core.env_client.ws_connect",
-                new_callable=AsyncMock,
-                return_value=mock_ws,
-            ):
-                sync_client = client.sync()
-                sync_client.connect()
-                assert client._production_session_id == "test-session"
+            new_callable=AsyncMock,
+            return_value={"result": {"status": "closed"}},
+        ) as mock_mcp_req:
+            await client.close()
 
-                sync_client.close()
+            mock_mcp_req.assert_awaited_once_with(
+                "openenv/session/close",
+                {"session_id": "test-session-async"},
+            )
+            assert client._production_session_id is None
+            mock_http_client.aclose.assert_awaited_once()
+            assert client._http_client is None
 
-                assert client._production_session_id is None
-                assert mock_mcp_request.call_count == 2
-                mock_mcp_request.assert_any_call(
-                    "openenv/session/close",
-                    {"session_id": "test-session"},
-                )
+    @pytest.mark.asyncio
+    async def test_websocket_disconnect_preserves_attached_http_session(self):
+        """Attaching `/ws` to an existing session must not destroy it on disconnect."""
+        from fastapi import FastAPI
+        from openenv.core.env_server.http_server import HTTPEnvServer
+        from openenv.core.env_server.interfaces import Environment
+        from openenv.core.env_server.types import Action, Observation
+        from starlette.testclient import TestClient
+
+        class MinimalAction(Action):
+            pass
+
+        class MinimalObservation(Observation):
+            pass
+
+        class MinimalEnvironment(Environment):
+            def reset(self):
+                return MinimalObservation()
+
+            def step(self, action):
+                return MinimalObservation()
+
+            @property
+            def state(self):
+                return {}
+
+        server = HTTPEnvServer(
+            env=MinimalEnvironment,
+            action_cls=MinimalAction,
+            observation_cls=MinimalObservation,
+        )
+        app = FastAPI()
+        server.register_routes(app)
+
+        session_id, env_instance = await server._create_session()
+        assert session_id in server._sessions
+
+        with TestClient(app) as test_client:
+            with test_client.websocket_connect(f"/ws?session_id={session_id}") as ws:
+                ws.send_json({"type": "close"})
+
+        assert session_id in server._sessions
+        assert server._sessions[session_id] is env_instance
+
+        await server._destroy_session(session_id)
+        assert session_id not in server._sessions
+
+    @pytest.mark.asyncio
+    async def test_websocket_disconnect_destroys_websocket_created_session(self):
+        """A WebSocket-created session must still be destroyed on disconnect."""
+        from fastapi import FastAPI
+        from openenv.core.env_server.http_server import HTTPEnvServer
+        from openenv.core.env_server.interfaces import Environment
+        from openenv.core.env_server.types import Action, Observation
+        from starlette.testclient import TestClient
+
+        class MinimalAction(Action):
+            pass
+
+        class MinimalObservation(Observation):
+            pass
+
+        class MinimalEnvironment(Environment):
+            def reset(self):
+                return MinimalObservation()
+
+            def step(self, action):
+                return MinimalObservation()
+
+            @property
+            def state(self):
+                return {}
+
+        server = HTTPEnvServer(
+            env=MinimalEnvironment,
+            action_cls=MinimalAction,
+            observation_cls=MinimalObservation,
+        )
+        app = FastAPI()
+        server.register_routes(app)
+
+        with TestClient(app) as test_client:
+            with test_client.websocket_connect("/ws") as ws:
+                assert len(server._sessions) == 1
+                ws.send_json({"type": "close"})
+
+        assert len(server._sessions) == 0
 
 
 # ============================================================================
