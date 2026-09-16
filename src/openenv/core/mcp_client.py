@@ -171,13 +171,16 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         """Build the HTTP MCP endpoint URL from the stable base URL."""
         if self._base_url is None:
             raise RuntimeError("MCP client is not connected to a server.")
-        # `_base_url` may be `ws://` / `wss://` (documented for EnvClient); httpx needs HTTP.
-        url = (
-            self._base_url.replace("ws://", "http://")
-            .replace("wss://", "https://")
-            .rstrip("/")
+        parts = urlsplit(self._base_url)
+        scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
+        return urlunsplit(
+            parts._replace(
+                scheme=scheme,
+                path=parts.path.rstrip("/") + "/mcp",
+                query="",
+                fragment="",
+            )
         )
-        return url + "/mcp"
 
     async def _get_http_client(self) -> Any:
         """Return a shared httpx.AsyncClient, creating one lazily."""
@@ -382,19 +385,30 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         """
         Close client resources.
 
-        In production MCP mode, this also closes the server-side persistent
-        MCP session (best effort) before closing websocket/provider resources.
+        In production MCP mode, detach the WebSocket first so
+        `openenv/session/close` is allowed by the server attachment guard,
+        then close the HTTP MCP session (best effort).
 
         Override `_close_async` rather than `close` so sync teardown
         (`SyncEnvClient.close`, sync `__exit__`, and `_dispatch`) still cleans
         up the HTTP MCP session.
         """
-        if self._production_session_id is not None:
+        session_id = self._production_session_id
+        if session_id is not None:
+            # Detach `/ws` before HTTP session close — the server rejects
+            # `openenv/session/close` while a WebSocket is still attached.
             try:
-                await self._production_mcp_request(
+                await self._disconnect_async()
+            except Exception:
+                pass
+            try:
+                data = await self._production_mcp_request(
                     "openenv/session/close",
-                    {"session_id": self._production_session_id},
+                    {"session_id": session_id},
                 )
+                # JSON-RPC errors are HTTP 200; treat them as failed cleanup.
+                if isinstance(data, dict) and data.get("error"):
+                    pass
             except Exception:
                 # Best effort cleanup - do not mask normal close behavior
                 pass

@@ -166,6 +166,20 @@ class TestEnvironmentVariableModeSelection:
 class TestModeBehavior:
     """Test that different modes result in different client behavior."""
 
+    @pytest.mark.parametrize(
+        ("base_url", "expected_url"),
+        [
+            ("http://localhost:8000", "http://localhost:8000/mcp"),
+            ("https://example.com/env", "https://example.com/env/mcp"),
+            ("ws://localhost:8000", "http://localhost:8000/mcp"),
+            ("wss://example.com/env", "https://example.com/env/mcp"),
+        ],
+    )
+    def test_production_mcp_url_uses_http_scheme(self, base_url, expected_url):
+        """HTTP MCP requests normalize WebSocket base URL schemes."""
+        client = MCPToolClient(base_url=base_url, mode="production")
+        assert client._production_mcp_url() == expected_url
+
     @pytest.mark.asyncio
     async def test_simulation_mode_uses_gym_protocol(self, clean_env, mock_websocket):
         """Test that simulation mode uses Gym-style WebSocket messages."""
@@ -255,17 +269,6 @@ class TestModeBehavior:
                     },
                 )
 
-    def test_production_mcp_url_converts_ws_base_url(self, clean_env):
-        """ws:// / wss:// base URLs must become http(s) for production /mcp posts."""
-        ws_client = MCPToolClient(base_url="ws://localhost:8000", mode="production")
-        assert ws_client._production_mcp_url() == "http://localhost:8000/mcp"
-
-        wss_client = MCPToolClient(base_url="wss://example.com", mode="production")
-        assert wss_client._production_mcp_url() == "https://example.com/mcp"
-
-        http_client = MCPToolClient(base_url="http://localhost:8000", mode="production")
-        assert http_client._production_mcp_url() == "http://localhost:8000/mcp"
-
     @pytest.mark.asyncio
     async def test_production_mode_connect_creates_single_session_with_websocket(
         self, clean_env
@@ -328,6 +331,34 @@ class TestModeBehavior:
                     await client.connect()
 
                 mock_close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_production_close_disconnects_websocket_before_session_close(
+        self, clean_env
+    ):
+        """Close must detach /ws before openenv/session/close (attachment guard)."""
+        client = MCPToolClient(base_url="http://localhost:8000", mode="production")
+        client._production_session_id = "sess-attach"
+        client._ws = MagicMock()
+        client._ws_loop = None
+
+        calls = []
+
+        async def fake_disconnect():
+            calls.append("disconnect")
+            client._ws = None
+
+        async def fake_mcp(method, params=None):
+            calls.append((method, params))
+            return {"result": {"closed": True}}
+
+        with patch.object(client, "_disconnect_async", side_effect=fake_disconnect):
+            with patch.object(client, "_production_mcp_request", side_effect=fake_mcp):
+                await client.close()
+
+        assert calls[0] == "disconnect"
+        assert calls[1] == ("openenv/session/close", {"session_id": "sess-attach"})
+        assert client._production_session_id is None
 
     def test_production_mode_sync_close_closes_mcp_session(self, clean_env):
         """Test that production sync close() closes the MCP session and releases HTTP client."""

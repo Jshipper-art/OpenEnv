@@ -787,7 +787,7 @@ class TestHTTPMCPSessionLifecycle:
             assert response2["data"]["result"]["session_id"] == ws_session_id
 
     def test_websocket_can_attach_to_http_session_without_destroying_it(self, app):
-        """An attached WebSocket shares and preserves an HTTP-created session."""
+        """An attached WebSocket shares an HTTP-created session until HTTP close."""
         client = TestClient(app)
         create_response = client.post(
             "/mcp",
@@ -805,18 +805,7 @@ class TestHTTPMCPSessionLifecycle:
             state_response = websocket.receive_json()
             assert state_response["type"] == "state"
 
-            active_close_response = client.post(
-                "/mcp",
-                json={
-                    "jsonrpc": "2.0",
-                    "method": "openenv/session/close",
-                    "params": {"session_id": session_id},
-                    "id": 2,
-                },
-            )
-            assert (
-                "active WebSocket" in active_close_response.json()["error"]["message"]
-            )
+            # Detach without destroying the HTTP-owned session.
             websocket.send_json({"type": "close"})
 
         tools_response = client.post(
@@ -840,6 +829,45 @@ class TestHTTPMCPSessionLifecycle:
             },
         )
         assert close_response.json()["result"]["closed"] is True
+
+    def test_http_session_close_destroys_session_even_while_websocket_attached(
+        self, app
+    ):
+        """HTTP openenv/session/close is authoritative over an attached WebSocket."""
+        client = TestClient(app)
+        create_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/create",
+                "params": {},
+                "id": 1,
+            },
+        )
+        session_id = create_response.json()["result"]["session_id"]
+
+        with client.websocket_connect(f"/ws?session_id={session_id}"):
+            close_response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "openenv/session/close",
+                    "params": {"session_id": session_id},
+                    "id": 2,
+                },
+            )
+            assert close_response.json()["result"]["closed"] is True
+
+        tools_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "params": {"session_id": session_id},
+                "id": 3,
+            },
+        )
+        assert "error" in tools_response.json()
 
     def test_http_session_allows_only_one_attached_websocket(self, app):
         """A second WebSocket cannot concurrently mutate the same session."""

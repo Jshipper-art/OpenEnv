@@ -812,29 +812,19 @@ class HTTPEnvServer:
                         request_id=request_id,
                     )
 
+                # HTTP `openenv/session/close` is authoritative: drop any
+                # WebSocket attachment marker and destroy the session. Clients
+                # should detach first; this still recovers if they race.
                 async with self._session_lock:
-                    if target_session_id in self._session_websocket_attachments:
-                        env = _MISSING
-                        attached = True
-                        executor = None
-                        stack = None
-                    else:
-                        attached = False
-                        env = self._sessions.pop(target_session_id, _MISSING)
-                    if not attached and env is not _MISSING:
+                    self._session_websocket_attachments.discard(target_session_id)
+                    env = self._sessions.pop(target_session_id, _MISSING)
+                    if env is not _MISSING:
                         executor = self._session_executors.pop(target_session_id, None)
                         stack = self._session_stacks.pop(target_session_id, None)
                         self._session_info.pop(target_session_id, None)
-                    elif not attached:
+                    else:
                         executor = None
                         stack = None
-
-                if attached:
-                    return JsonRpcResponse.error_response(
-                        JsonRpcErrorCode.INVALID_REQUEST,
-                        f"Session {target_session_id} has an active WebSocket",
-                        request_id=request_id,
-                    )
 
                 if env is _MISSING:
                     return JsonRpcResponse.error_response(
