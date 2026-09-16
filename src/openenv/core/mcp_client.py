@@ -385,45 +385,44 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         """
         Close client resources.
 
-        In production MCP mode, detach the WebSocket first so
-        `openenv/session/close` is allowed by the server attachment guard,
-        then close the HTTP MCP session (best effort).
+        In production MCP mode, this also closes the server-side persistent
+        MCP session (best effort) after detaching the WebSocket and before
+        closing HTTP/provider resources.
 
         Override `_close_async` rather than `close` so sync teardown
         (`SyncEnvClient.close`, sync `__exit__`, and `_dispatch`) still cleans
         up the HTTP MCP session.
         """
-        session_id = self._production_session_id
-        if session_id is not None:
-            # Detach `/ws` before HTTP session close — the server rejects
-            # `openenv/session/close` while a WebSocket is still attached.
+        try:
+            # The WebSocket shares the HTTP-created session. Detach it first so
+            # the server's ownership guard permits the explicit session close.
+            await self._disconnect_async()
+        finally:
             try:
-                await self._disconnect_async()
-            except Exception:
-                pass
-            try:
-                data = await self._production_mcp_request(
-                    "openenv/session/close",
-                    {"session_id": session_id},
-                )
-                # JSON-RPC errors are HTTP 200; treat them as failed cleanup.
-                if isinstance(data, dict) and data.get("error"):
-                    pass
-            except Exception:
-                # Best effort cleanup - do not mask normal close behavior
-                pass
+                if self._production_session_id is not None:
+                    try:
+                        await self._production_mcp_request(
+                            "openenv/session/close",
+                            {"session_id": self._production_session_id},
+                        )
+                    except Exception:
+                        # Best effort cleanup - do not mask normal close behavior
+                        pass
+                    finally:
+                        self._production_session_id = None
             finally:
-                self._production_session_id = None
-
-        if self._http_client is not None:
-            try:
-                await self._http_client.aclose()
-            except Exception:
-                pass
-            finally:
-                self._http_client = None
-
-        await super()._close_async()
+                try:
+                    if self._http_client is not None:
+                        try:
+                            await self._http_client.aclose()
+                        except Exception:
+                            pass
+                        finally:
+                            self._http_client = None
+                finally:
+                    # This is intentionally inside the outer finally so
+                    # cancellation cannot skip provider teardown.
+                    await super()._close_async()
 
 
 class MCPToolClient(MCPClientBase):
