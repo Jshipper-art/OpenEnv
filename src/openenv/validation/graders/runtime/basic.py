@@ -143,7 +143,10 @@ class ObservationSchemaGrader(_RuntimeGrader):
         try:
             checked = subprocess.run(
                 [sys.executable, "-I", str(worker)],
-                input=json.dumps({"schema": schema, "observations": observations}),
+                input=json.dumps(
+                    {"schema": schema, "observations": observations},
+                    ensure_ascii=False,
+                ),
                 capture_output=True,
                 text=True,
                 timeout=5,

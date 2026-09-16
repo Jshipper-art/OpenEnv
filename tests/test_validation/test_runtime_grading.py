@@ -219,6 +219,45 @@ def test_schema_reconstructs_reward_and_done_from_envelope(tmp_path):
     )
 
 
+def test_unicode_trace_within_wire_budget_reaches_schema_worker_intact(tmp_path):
+    text = "\U0001f600" * 150_000
+    rows = []
+    for index in range(6):
+        operation = "reset" if index == 0 else "step"
+        rows.append(
+            WireExchange(
+                operation,
+                json.dumps({"type": operation}),
+                json.dumps(
+                    {
+                        "type": "observation",
+                        "data": {
+                            "observation": {"counter": index, "text": text},
+                            "reward": None if index == 0 else 0,
+                            "done": False,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+    assert (
+        sum(
+            len(row.request_json.encode()) + len(row.response_json.encode())
+            for row in rows
+        )
+        < 8 * 1024 * 1024
+    )
+    assert len(json.dumps([text] * len(rows))) > 10 * 1024 * 1024
+    schema = copy.deepcopy(OBSERVATION_SCHEMA)
+    schema["properties"]["text"] = {"type": "string"}
+    schema["required"].append("text")
+
+    result = ObservationSchemaGrader().run(subject_with(tmp_path, rows, schema=schema))
+
+    assert result.status is CheckStatus.PASS
+
+
 @pytest.mark.parametrize(
     "field,value", [("done", None), ("done", "false"), ("done", 0), ("observation", [])]
 )
