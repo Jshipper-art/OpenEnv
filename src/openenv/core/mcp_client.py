@@ -168,6 +168,9 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
     def _production_mcp_url(self) -> str:
         """Build HTTP MCP endpoint URL from the client's websocket URL."""
         url = self._ws_url.replace("ws://", "http://").replace("wss://", "https://")
+        # Strip query/fragment so a temporary `?session_id=` rewrite on `_ws_url`
+        # cannot poison session create/close posts to `/mcp`.
+        url = url.split("?", 1)[0].split("#", 1)[0]
         if url.endswith("/ws"):
             url = url[: -len("/ws")]
         return url.rstrip("/") + "/mcp"
@@ -202,16 +205,24 @@ class MCPClientBase(EnvClient[Any, Observation, State]):
         """
         Establish connection to the server.
 
-        In production mode (`use_production_mode=True`), open the WebSocket used
-        by `reset` / `step` / `state` and create a persistent HTTP MCP session
-        for `list_tools` / `call_tool`. Tool calls bypass `step()` over `/mcp`,
-        but the Gym lifecycle still requires `/ws` until production routing
-        covers those methods end-to-end.
+        In production mode (`use_production_mode=True`), create a persistent HTTP
+        MCP session first, then open the WebSocket with that `session_id` so
+        `reset` / `step` / `state` and `list_tools` / `call_tool` share one
+        server-side environment (avoids dual-session capacity failures).
         """
         if getattr(self, "use_production_mode", False):
             try:
-                await super()._connect_async()
-                await self._ensure_production_session()
+                self._start_provider_if_needed()
+                session_id = await self._ensure_production_session()
+                original_ws_url = self._ws_url
+                if self._ws_url and "session_id=" not in self._ws_url:
+                    sep = "&" if "?" in self._ws_url else "?"
+                    self._ws_url = f"{self._ws_url}{sep}session_id={session_id}"
+                try:
+                    await super()._connect_async()
+                finally:
+                    # Always restore so failed connect / close still posts to `/mcp`.
+                    self._ws_url = original_ws_url
             except Exception:
                 await self.close()
                 raise
