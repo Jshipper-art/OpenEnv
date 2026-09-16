@@ -293,15 +293,16 @@ static manifest check; the report's `levels_run` field records exactly which
 levels executed. Use `openenv validate --url http://localhost:8000` separately
 to validate a running endpoint.
 
-You can also validate a running environment endpoint and get criteria-level JSON:
+Runtime validation is human-readable by default. Add `--json` for
+criteria-level JSON:
 
 ```bash
-openenv validate --url http://localhost:8000
+openenv validate --url http://localhost:8000 --json
 # or
-openenv validate https://username-my-env.hf.space
+openenv validate https://username-my-env.hf.space --json
 ```
 
-Example runtime output:
+Example JSON runtime output:
 
 ```json
 {
