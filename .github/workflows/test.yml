@@ -39,7 +39,7 @@ jobs:
 
           mapfile -t env_dirs < <(
             git diff --name-only "$base_sha" "$head_sha" \
-              | rg '^envs/[^/]+/(pyproject\.toml|uv\.lock)$' \
+              | grep -E '^envs/[^/]+/(pyproject\.toml|uv\.lock)$' \
               | xargs -r -n1 dirname \
               | sort -u
           )
