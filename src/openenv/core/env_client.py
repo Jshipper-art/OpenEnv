@@ -255,8 +255,8 @@ async def _best_effort_close(ws: ClientConnection) -> None:
         pass  # Best effort
 
 
-async def _best_effort_disconnect(ws: ClientConnection) -> None:
-    """Notify the server and close a socket despite caller cancellation."""
+async def _best_effort_graceful_close(ws: ClientConnection) -> None:
+    """Notify the server, then close a socket without propagating failures."""
     try:
         await ws.send(json.dumps({"type": "close"}))
     except (Exception, asyncio.CancelledError):
@@ -589,6 +589,18 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     def disconnect(self) -> Any:
         return self._dispatch(self._disconnect_async)
 
+    def _schedule_socket_close(
+        self, ws: ClientConnection, *, notify_server: bool = False
+    ) -> asyncio.Task[None]:
+        """Schedule and track a socket close until its handshake finishes."""
+        close_coro = (
+            _best_effort_graceful_close(ws) if notify_server else _best_effort_close(ws)
+        )
+        close_task = asyncio.create_task(close_coro)
+        self._pending_close_tasks.add(close_task)
+        close_task.add_done_callback(self._pending_close_tasks.discard)
+        return close_task
+
     async def _disconnect_async(self) -> None:
         """Close the WebSocket connection."""
         if self._ws is not None:
@@ -600,13 +612,10 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             self._ws_loop = None
             same_loop = ws_loop is asyncio.get_running_loop()
             if same_loop:
-                # Keep a strong, drainable reference to the entire handshake.
-                # If this caller is cancelled, the task continues in the
-                # background and a later reconnect waits for it to release the
-                # old server-side session's capacity slot.
-                close_task = asyncio.ensure_future(_best_effort_disconnect(ws))
-                self._pending_close_tasks.add(close_task)
-                close_task.add_done_callback(self._pending_close_tasks.discard)
+                # Keep ownership of the handshake if this caller is cancelled.
+                # A later close/reconnect drains the task before tearing down
+                # the loop or opening a replacement server session.
+                close_task = self._schedule_socket_close(ws, notify_server=True)
                 await asyncio.shield(close_task)
 
     async def _drain_pending_close_tasks(self) -> None:
@@ -675,9 +684,7 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
             # would actually block for up to 10s before its deadline was
             # honored. Scheduling it lets the exception propagate
             # immediately while the close still happens in the background.
-            close_task = asyncio.ensure_future(_best_effort_close(ws))
-            self._pending_close_tasks.add(close_task)
-            close_task.add_done_callback(self._pending_close_tasks.discard)
+            self._schedule_socket_close(ws)
             raise
         return json.loads(raw)
 
@@ -984,6 +991,40 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
     def close(self) -> Any:
         return self._dispatch(self._close_async)
 
+    async def _close_child_clients(self) -> asyncio.CancelledError | None:
+        """Close every captured child while deferring caller cancellation."""
+        children = list(self._child_clients)
+        self._child_clients.clear()
+        close_tasks = []
+        deferred_cancellation: asyncio.CancelledError | None = None
+
+        for child in children:
+            try:
+                close_tasks.append(asyncio.ensure_future(child.close()))
+            except asyncio.CancelledError as exc:
+                if deferred_cancellation is None:
+                    deferred_cancellation = exc
+            except Exception:
+                pass  # Best effort
+
+        if close_tasks:
+            close_group = asyncio.gather(*close_tasks, return_exceptions=True)
+            while not close_group.done():
+                try:
+                    await asyncio.shield(close_group)
+                except asyncio.CancelledError as exc:
+                    if deferred_cancellation is None:
+                        deferred_cancellation = exc
+
+            for result in close_group.result():
+                if (
+                    isinstance(result, asyncio.CancelledError)
+                    and deferred_cancellation is None
+                ):
+                    deferred_cancellation = result
+
+        return deferred_cancellation
+
     async def _close_async(self) -> None:
         """
         Close the WebSocket connection and clean up resources.
@@ -991,40 +1032,32 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
         If this client was created via from_docker_image() or from_env(),
         this will also stop and remove the associated container/process.
         """
+        deferred_cancellation: asyncio.CancelledError | None = None
         try:
             try:
-                children = list(self._child_clients)
-                self._child_clients.clear()
-                if children:
+                try:
+                    child_cancellation = await self._close_child_clients()
+                except asyncio.CancelledError as exc:
+                    child_cancellation = exc
+                if child_cancellation is not None:
+                    deferred_cancellation = child_cancellation
 
-                    async def close_child(child: EnvClient) -> None:
-                        with suppress(Exception):
-                            await child.close()
-
-                    # Start every child close before awaiting any one of them.
-                    # Defer caller cancellation until all closes finish so a
-                    # suspended first child cannot strand later sessions.
-                    child_closes = asyncio.gather(
-                        *(close_child(child) for child in children),
-                        return_exceptions=True,
-                    )
-                    cancellation: asyncio.CancelledError | None = None
-                    while not child_closes.done():
-                        try:
-                            await asyncio.shield(child_closes)
-                        except asyncio.CancelledError as exc:
-                            cancellation = exc
-                    if cancellation is not None:
-                        raise cancellation
-                # A real close waits out backgrounded closes, but shield them
-                # from cancellation so their socket handshakes aren't
-                # abandoned midway.
-                await self._drain_pending_close_tasks()
+                # A real close waits out backgrounded closes, while shielding
+                # their socket handshakes from cancellation.
+                try:
+                    await self._drain_pending_close_tasks()
+                except asyncio.CancelledError as exc:
+                    if deferred_cancellation is None:
+                        deferred_cancellation = exc
             finally:
-                # Run even when pending-close draining is cancelled. A client
-                # may already have reconnected, and that current socket must
-                # not remain cached or open during teardown.
-                await self._disconnect_async()
+                # Run even when child or pending-close cleanup is cancelled. A
+                # client may already have reconnected, and that current socket
+                # must not remain cached or open during teardown.
+                try:
+                    await self._disconnect_async()
+                except asyncio.CancelledError as exc:
+                    if deferred_cancellation is None:
+                        deferred_cancellation = exc
         finally:
             try:
                 if self._provider is not None:
@@ -1037,6 +1070,9 @@ class EnvClient(ABC, Generic[ActT, ObsT, StateT]):
                 if self._start_provider_on_connect:
                     self._base_url = None
                     self._ws_url = None
+
+        if deferred_cancellation is not None:
+            raise deferred_cancellation
 
     def _stop_provider_best_effort(self) -> None:
         """Stop the underlying provider directly, ignoring any errors.

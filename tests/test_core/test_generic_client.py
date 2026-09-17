@@ -174,6 +174,83 @@ class TestGenericEnvClientInstantiation:
         assert client._child_clients == []
         mock_provider.stop_container.assert_called_once_with()
 
+    @pytest.mark.asyncio
+    async def test_cancelled_child_close_still_closes_all_children_and_parent(self):
+        """Cancellation waits for every child before parent teardown."""
+
+        class FakeRuntimeProvider:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        first_close_started = asyncio.Event()
+        release_first_close = asyncio.Event()
+        second_close_completed = asyncio.Event()
+
+        class FirstChild:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                first_close_started.set()
+                await release_first_close.wait()
+                self.closed = True
+
+        class SecondChild:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+                second_close_completed.set()
+
+        class ParentSocket:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def close(self):
+                self.state = State.CLOSED
+
+        provider = FakeRuntimeProvider()
+        client = GenericEnvClient(provider=provider)
+        client._base_url = "http://localhost:8000"
+        client._ws_url = "ws://localhost:8000/ws"
+        parent_ws = ParentSocket()
+        client._ws = parent_ws
+        client._ws_loop = asyncio.get_running_loop()
+        first_child = FirstChild()
+        second_child = SecondChild()
+        client._child_clients.extend([first_child, second_child])
+
+        close_call = asyncio.create_task(client._close_async())
+        await first_close_started.wait()
+        close_call.cancel()
+
+        await asyncio.wait_for(second_close_completed.wait(), timeout=1)
+        assert not close_call.done()
+        assert parent_ws.state != State.CLOSED
+        assert not provider.stopped
+
+        release_first_close.set()
+        close_results = await asyncio.wait_for(
+            asyncio.gather(close_call, return_exceptions=True), timeout=1
+        )
+
+        assert len(close_results) == 1
+        assert isinstance(close_results[0], asyncio.CancelledError)
+        assert first_child.closed
+        assert second_child.closed
+        assert client._child_clients == []
+        assert client._ws is None
+        assert parent_ws.state == State.CLOSED
+        assert provider.stopped
+        assert client._base_url is None
+        assert client._ws_url is None
+
     def test_session_client_filters_constructor_kwargs(self):
         """Child creation respects subclasses with narrower __init__ signatures."""
 
@@ -1713,10 +1790,68 @@ class TestForeignLoopReconnect:
             mock_connect.assert_not_called()
 
             release_close.set()
-            await reconnect
+            await asyncio.wait_for(reconnect, timeout=1)
 
         mock_connect.assert_called_once()
         assert dropped_ws.state == State.CLOSED
+        assert client._ws is replacement_ws
+        await client._close_async()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_close_tracks_current_socket_until_handshake_finishes(
+        self,
+    ):
+        """Cancelling the current close must not abandon its server session."""
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+
+        class SlowCurrentSocket:
+            state = State.OPEN
+
+            async def send(self, _message):
+                pass
+
+            async def close(self):
+                close_started.set()
+                await release_close.wait()
+                self.state = State.CLOSED
+
+        client = GenericEnvClient(base_url="http://localhost:8000")
+        current_ws = SlowCurrentSocket()
+        client._ws = current_ws
+        client._ws_loop = asyncio.get_running_loop()
+
+        close_call = asyncio.create_task(client._close_async())
+        await close_started.wait()
+        assert client._pending_close_tasks
+
+        close_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_call
+
+        assert client._ws is None
+        assert current_ws.state == State.OPEN
+        assert any(not task.cancelled() for task in client._pending_close_tasks)
+
+        replacement_ws = AsyncMock()
+        replacement_ws.state = State.OPEN
+
+        async def fake_ws_connect(*args, **kwargs):
+            return replacement_ws
+
+        with patch(
+            "openenv.core.env_client.ws_connect", side_effect=fake_ws_connect
+        ) as mock_connect:
+            reconnect = asyncio.create_task(client._connect_async())
+            await asyncio.sleep(0)
+            assert not reconnect.done()
+            mock_connect.assert_not_called()
+
+            release_close.set()
+            await asyncio.wait_for(reconnect, timeout=1)
+
+        assert current_ws.state == State.CLOSED
+        mock_connect.assert_called_once()
         assert client._ws is replacement_ws
         await client._close_async()
 
@@ -1784,137 +1919,6 @@ class TestForeignLoopReconnect:
         release_close.set()
         await pending
         assert dropped_ws.state == State.CLOSED
-
-    @pytest.mark.asyncio
-    async def test_cancelled_current_close_is_drained_before_reconnect(self):
-        """A cancelled active handshake must still release session capacity."""
-        close_started = asyncio.Event()
-        release_close = asyncio.Event()
-
-        class SlowCurrentSocket:
-            state = State.OPEN
-
-            async def send(self, _message):
-                pass
-
-            async def close(self):
-                close_started.set()
-                await release_close.wait()
-                self.state = State.CLOSED
-
-        client = GenericEnvClient(base_url="http://localhost:8000")
-        current_ws = SlowCurrentSocket()
-        client._ws = current_ws
-        client._ws_loop = asyncio.get_running_loop()
-
-        close_task = asyncio.create_task(client._close_async())
-        await close_started.wait()
-        close_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await close_task
-
-        assert client._ws is None
-        assert current_ws.state == State.OPEN
-        assert any(not task.done() for task in client._pending_close_tasks)
-
-        replacement_ws = AsyncMock()
-        replacement_ws.state = State.OPEN
-
-        async def fake_ws_connect(*args, **kwargs):
-            return replacement_ws
-
-        with patch(
-            "openenv.core.env_client.ws_connect", side_effect=fake_ws_connect
-        ) as mock_connect:
-            reconnect = asyncio.create_task(client._connect_async())
-            await asyncio.sleep(0)
-            assert not reconnect.done()
-            mock_connect.assert_not_called()
-
-            release_close.set()
-            await asyncio.wait_for(reconnect, timeout=1)
-
-        assert current_ws.state == State.CLOSED
-        assert client._ws is replacement_ws
-        mock_connect.assert_called_once()
-        await client._close_async()
-
-    @pytest.mark.asyncio
-    async def test_cancelled_child_close_finishes_all_children_and_parent(self):
-        """Cancellation during one child must not strand later sessions."""
-
-        class FakeRuntimeProvider:
-            def __init__(self):
-                self.stopped = False
-
-            def stop(self):
-                self.stopped = True
-
-        first_close_started = asyncio.Event()
-        release_first_close = asyncio.Event()
-
-        class SlowFirstChild:
-            def __init__(self):
-                self.closed = False
-
-            async def close(self):
-                first_close_started.set()
-                await release_first_close.wait()
-                self.closed = True
-
-        class LaterChild:
-            def __init__(self):
-                self.closed = False
-
-            async def close(self):
-                self.closed = True
-
-        class CurrentSocket:
-            state = State.OPEN
-
-            async def send(self, _message):
-                pass
-
-            async def close(self):
-                self.state = State.CLOSED
-
-        provider = FakeRuntimeProvider()
-        client = GenericEnvClient(provider=provider)
-        client._base_url = "http://localhost:8000"
-        client._ws_url = "ws://localhost:8000/ws"
-        first_child = SlowFirstChild()
-        later_child = LaterChild()
-        client._child_clients.extend([first_child, later_child])
-
-        current_ws = CurrentSocket()
-        client._ws = current_ws
-        client._ws_loop = asyncio.get_running_loop()
-
-        close_task = asyncio.create_task(client._close_async())
-        await asyncio.wait_for(first_close_started.wait(), timeout=1)
-        close_task.cancel()
-        await asyncio.sleep(0)
-
-        assert not close_task.done()
-        assert later_child.closed
-        assert not provider.stopped
-
-        release_first_close.set()
-        cancelled = False
-        try:
-            await close_task
-        except asyncio.CancelledError:
-            cancelled = True
-
-        assert cancelled
-        assert first_child.closed
-        assert later_child.closed
-        assert client._child_clients == []
-        assert client._ws is None
-        assert current_ws.state == State.CLOSED
-        assert provider.stopped
-        assert client._base_url is None
-        assert client._ws_url is None
 
 
 # ============================================================================

@@ -363,20 +363,18 @@ class TestCacheSecurity:
         assert path.is_absolute()
         assert path.resolve() != planted.resolve()
 
-    def test_relative_home_cache_fallback_fails_closed(self, tmp_path, monkeypatch):
-        """Invalid XDG and HOME paths must not resolve inside the checkout."""
+    @pytest.mark.parametrize("xdg_cache_home", ["cache", ""])
+    def test_relative_home_cannot_restore_a_relative_cache_path(
+        self, tmp_path, monkeypatch, xdg_cache_home
+    ):
+        """Invalid XDG and home paths must fail closed, not trust the checkout."""
         checkout = tmp_path / "untrusted-checkout"
-        planted = (
-            checkout / "relative-home" / ".cache" / "openenv" / "discovery_cache.json"
-        )
-        planted.parent.mkdir(parents=True)
-        planted.write_text("{}")
-
+        checkout.mkdir()
         monkeypatch.chdir(checkout)
-        monkeypatch.setenv("XDG_CACHE_HOME", "cache")
+        monkeypatch.setenv("XDG_CACHE_HOME", xdg_cache_home)
         monkeypatch.setenv("HOME", "relative-home")
 
-        with pytest.raises(RuntimeError, match="absolute user cache directory"):
+        with pytest.raises(RuntimeError, match="absolute home directory"):
             _default_cache_file()
 
     def test_world_writable_cache_is_not_trusted(self, tmp_path):

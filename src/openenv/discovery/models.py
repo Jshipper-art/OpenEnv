@@ -56,7 +56,7 @@ def relative_path(value: str) -> str:
         or any(
             ord(character) < 0x20
             or 0x7F <= ord(character) <= 0x9F
-            or character in "\u2028\u2029"
+            or ord(character) in (0x2028, 0x2029)
             for character in value
         )
         or "\\" in value
