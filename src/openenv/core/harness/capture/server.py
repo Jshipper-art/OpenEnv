@@ -1348,6 +1348,14 @@ def create_app(
     return app
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Whether `host` is a loopback-only bind (private local port).
+
+    `0.0.0.0` / `::` are intentionally not loopback: they publish on every interface.
+    """
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1366,7 +1374,12 @@ def main() -> None:
         "upstream may be a hosted provider, and reporting one of these two when it is not says "
         "something untrue about capture.",
     )
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="bind address (default: 0.0.0.0). Non-loopback binds mint an admin key when none is "
+        "set so /sessions* is never left open on a reachable interface.",
+    )
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument(
         "--max-output-tokens",
@@ -1402,8 +1415,8 @@ def main() -> None:
         "--admin-key",
         default=os.environ.get("OPENENV_CAPTURE_ADMIN_KEY", ""),
         help="key the session-management routes (/sessions*) require (defaults to "
-        "$OPENENV_CAPTURE_ADMIN_KEY). Set it whenever this port is reachable from outside: "
-        "unset, anyone who can reach the port can list, read, delete and mint sessions.",
+        "$OPENENV_CAPTURE_ADMIN_KEY). Required for non-loopback binds: if unset there, a random "
+        "key is minted and printed. Loopback-only binds may leave it unset.",
     )
     args = parser.parse_args()
 
@@ -1430,6 +1443,17 @@ def main() -> None:
         for fix in report.param_fixes:
             print(f"  upstream compat: {fix}")
 
+    # Flag/env win; otherwise mint when the bind is reachable from outside. Leaving the key unset
+    # with --host 0.0.0.0 (the CLI default) would publish /sessions* ungated — the same open
+    # control plane `run_batch` already refuses. Loopback stays fail-open for private local use.
+    admin_key = args.admin_key or None
+    if not admin_key and not _is_loopback_host(args.host):
+        admin_key = secrets.token_urlsafe(32)
+        print(
+            f"capture admin key (minted for --host={args.host}; "
+            f"set --admin-key or $OPENENV_CAPTURE_ADMIN_KEY to pin): {admin_key}"
+        )
+
     uvicorn.run(
         create_app(
             llm_url=args.llm_url,
@@ -1440,7 +1464,7 @@ def main() -> None:
             api_key=args.api_key or None,
             auth_header=args.auth_header,
             capture_level=level,
-            admin_key=args.admin_key or None,
+            admin_key=admin_key,
         ),
         host=args.host,
         port=args.port,

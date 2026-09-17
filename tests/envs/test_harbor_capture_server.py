@@ -171,10 +171,29 @@ def test_cli_admin_key_defaults_to_the_env_var(monkeypatch):
     assert seen["admin_key"] == "from-env"
 
 
-def test_cli_leaves_admin_key_unset_without_flag_or_env(monkeypatch):
-    """A private local port stays as convenient as before; the CLI does not mint a key."""
+def test_cli_mints_admin_key_for_default_non_loopback_host(monkeypatch):
+    """Default `--host 0.0.0.0` must never leave `/sessions*` ungated."""
     monkeypatch.delenv("OPENENV_CAPTURE_ADMIN_KEY", raising=False)
 
     seen = run_cli(monkeypatch)
+
+    assert seen["admin_key"], "default non-loopback bind must mint an admin key"
+    assert len(seen["admin_key"]) >= 32
+
+
+def test_cli_mints_admin_key_for_explicit_non_loopback_host(monkeypatch):
+    monkeypatch.delenv("OPENENV_CAPTURE_ADMIN_KEY", raising=False)
+
+    seen = run_cli(monkeypatch, "--host", "0.0.0.0")
+
+    assert seen["admin_key"]
+    assert len(seen["admin_key"]) >= 32
+
+
+def test_cli_leaves_admin_key_unset_on_loopback_without_flag_or_env(monkeypatch):
+    """A private loopback port stays as convenient as before; no key is minted."""
+    monkeypatch.delenv("OPENENV_CAPTURE_ADMIN_KEY", raising=False)
+
+    seen = run_cli(monkeypatch, "--host", "127.0.0.1")
 
     assert seen["admin_key"] is None
