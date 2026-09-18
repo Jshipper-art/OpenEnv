@@ -21,8 +21,18 @@ from openenv.core.env_server.interfaces import (
 )
 
 from ..models import CodeAction, CodeObservation, CodeState
-from .python_executor import PyExecutor
+from .python_executor import DEFAULT_SAFE_IMPORTS, PyExecutor
 from .transforms import create_safe_coding_transform
+
+
+def _authorized_imports(additional_imports: list[str] | None) -> list[str] | None:
+    """PyExecutor takes a complete allowlist, so keep the defaults in it."""
+    if additional_imports is None:
+        return None
+
+    merged = list(DEFAULT_SAFE_IMPORTS)
+    merged.extend(name for name in additional_imports if name not in merged)
+    return merged
 
 
 class PythonCodeActEnv(Environment):
@@ -36,6 +46,7 @@ class PythonCodeActEnv(Environment):
     Args:
         transform: Optional transform to apply to observations
         additional_imports: List of additional module imports to authorize
+                          on top of DEFAULT_SAFE_IMPORTS
                           (e.g., ["numpy", "pandas", "matplotlib"])
 
     Example:
@@ -54,9 +65,9 @@ class PythonCodeActEnv(Environment):
         additional_imports: list[str] | None = None,
     ):
         self._transform = transform
-        self._additional_imports = additional_imports
+        self._additional_imports = _authorized_imports(additional_imports)
         self.transform = transform or create_safe_coding_transform()
-        self._executor = PyExecutor(additional_imports=additional_imports)
+        self._executor = PyExecutor(additional_imports=self._additional_imports)
         self._state = CodeState()
 
     def reset(self) -> Observation:
